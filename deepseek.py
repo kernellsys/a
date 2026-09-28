@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+# O acesso total fica desativado por padrao. Para habilita-lo, inicie com
+# `python deepseek.py --unsafe` e confirme digitando a frase exigida.
+FULL_ACCESS_MODE = False
+FULL_ACCESS_CONFIRMATION = "LIBERAR ACESSO TOTAL"
+
+
 def ensure_pkg(import_name: str, pip_name: Optional[str] = None) -> None:
     pip_name = pip_name or import_name
     try:
@@ -318,7 +324,24 @@ def clean_output(text: str) -> str:
 
 
 def safe_path(p: str) -> Path:
-    p_str = str(p).replace("\\", "/").lstrip("/")
+    """Resolve caminhos conforme o modo selecionado.
+
+    No modo normal, os arquivos ficam confinados a CONFIG.workspace.
+    No modo --unsafe, caminhos absolutos e relativos podem apontar para
+    qualquer local acessível pelo usuário do processo.
+    """
+    raw = os.path.expandvars(os.path.expanduser(str(p).strip()))
+
+    if FULL_ACCESS_MODE:
+        # Mantém a convenção da interface: workspace/foo continua sendo
+        # relativo à pasta de trabalho, enquanto caminhos absolutos são
+        # preservados sem a barreira de workspace.
+        normalized = raw.replace("\\", "/")
+        if normalized.startswith("workspace/"):
+            return (CONFIG.workspace / normalized[len("workspace/"):]).resolve()
+        return Path(raw).resolve()
+
+    p_str = raw.replace("\\", "/").lstrip("/")
     if p_str.startswith("workspace/"):
         p_str = p_str[len("workspace/"):]
     full = (CONFIG.workspace / p_str).resolve()
@@ -5892,7 +5915,30 @@ class CommandHandler:
 MAX_CONTINUATIONS = 6
 
 
+def enable_full_access_from_cli() -> None:
+    """Habilita acesso fora do workspace somente após confirmação explícita."""
+    global FULL_ACCESS_MODE
+    if "--unsafe" not in sys.argv:
+        return
+
+    print("ATENÇÃO: --unsafe permite ler, criar, alterar e apagar arquivos fora do workspace.")
+    print("Também permite executar comandos com o usuário atual do sistema.")
+    try:
+        answer = input(f"Digite exatamente '{FULL_ACCESS_CONFIRMATION}' para continuar: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nModo irrestrito cancelado.")
+        raise SystemExit(2)
+
+    if answer != FULL_ACCESS_CONFIRMATION:
+        print("Confirmação incorreta; modo irrestrito não foi ativado.")
+        raise SystemExit(2)
+
+    FULL_ACCESS_MODE = True
+    print("Modo irrestrito ATIVADO. Use somente em ambiente confiável.")
+
+
 def main():
+    enable_full_access_from_cli()
     storage = JsonStorage(CONFIG.json_path)
     data = storage.load()
 
