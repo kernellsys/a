@@ -40,9 +40,8 @@ static void out(WORD, const char* fmt, ...) {
 #define YELLOW 0
 #define DEF   0
 
-// ============================================================================
-// Scanner
-// ============================================================================
+static volatile LONG g_init_top = 0;
+
 static void* scan_mask(HMODULE mod, const char* pattern, const char* mask, unsigned occurrence = 1) {
     if (!mod || !pattern || !mask) return nullptr;
     size_t len = strlen(mask);
@@ -76,9 +75,15 @@ static void* scan_mask(HMODULE mod, const char* pattern, const char* mask, unsig
     return nullptr;
 }
 
-// ============================================================================
-// Originais MTA
-// ============================================================================
+ 
+static void silent_retire_hooks();
+static void mta_logf(const char* tag, const char* fmt, ...);
+ 
+static uint32_t      g_netc_base          = 0;
+static uint32_t      g_netc_size          = 0;
+
+ 
+
 using fn_send_packet    = bool(__fastcall*)(void*, void*, unsigned char, void*, int, int, int);
 using fn_send_lua_check = int(__fastcall*)(DWORD*, void*, unsigned __int8);
 using fn_sub_102BDFDE   = int(__cdecl*)(__int64*);
@@ -87,9 +92,18 @@ static fn_send_packet    g_o_send_packet    = nullptr;
 static fn_send_lua_check g_o_send_lua_check = nullptr;
 static fn_sub_102BDFDE   g_o_sub_102BDFDE   = nullptr;
 
-// ============================================================================
-// Detours MTA
-// ============================================================================
+using fn_add_net_report_log_raw    = int  (__stdcall*)(const char*, int);
+using fn_ac_check_hooking_function = bool (__fastcall*)(void*, void*);
+using fn_ac_send_client_kick       = int  (__fastcall*)(void*, void*, DWORD*, int);
+using fn_add_ac_log_path_hook      = int  (__stdcall*)(const char*);
+using fn_ac_watchdog               = int  (__stdcall*)(void*);
+
+static fn_add_net_report_log_raw    g_o_add_net_report_log_raw    = nullptr;
+static fn_ac_check_hooking_function g_o_ac_check_hooking_function = nullptr;
+static fn_ac_send_client_kick       g_o_ac_send_client_kick       = nullptr;
+static fn_add_ac_log_path_hook      g_o_add_ac_log_path_hook      = nullptr;
+static fn_ac_watchdog               g_o_ac_watchdog               = nullptr;
+
 static bool __cdecl d_advanced_memory_validator(int, int, int, DWORD*, int*, DWORD*) { return true; }
 static int  __fastcall d_network_packet_state_validator(DWORD*, void*, int, unsigned __int8, unsigned __int16) { return 1; }
 static char __stdcall  d_animation_packet_validator(int*) { return 1; }
@@ -97,6 +111,8 @@ static char __stdcall  d_animation_packet_validator(int*) { return 1; }
 static bool __fastcall d_send_packet(void* ECX, void* EDX, unsigned char ucPacketID, void* bitStream,
                                      int packetPriority, int packetReliability, int packetOrdering) {
     if (ucPacketID == 33) {
+         
+        silent_retire_hooks();
         if (packetReliability == 3) return true;
         if (packetReliability != 1 || !(*(DWORD**)0xBA18FC)) return true;
     }
@@ -150,16 +166,71 @@ static unsigned int __fastcall d_sub_100D57B0(int, int, unsigned int) { return 0
 static LONG  __stdcall d_veh_stack(void*)          { return 0; }
 static DWORD __stdcall d_ac_start_watchdog(void*)  { return 0; }
 
-// ============================================================================
-// Patch JMP + Watchdog (re-hook a cada 2ms se removido)
-// ============================================================================
+static int  __stdcall  d_add_net_report_log_raw(const char*, int)             { return 1; }
+static bool __fastcall d_ac_check_hooking_function(void*, void*)              { return false; }
+static int  __fastcall d_ac_send_client_kick(void*, void*, DWORD*, int)       { return 1; }
+static int  __stdcall  d_add_ac_log_path_hook(const char*)                    { return 1; }
+static int  __stdcall  d_ac_watchdog(void*)                                   { return 0; }
+
+ 
+using fn_add_net_report_log_raw_v2 = int(__stdcall*)(const char*, int);
+static fn_add_net_report_log_raw_v2 g_o_add_net_report_log_raw_v2 = nullptr;
+
+static __declspec(naked) void hk_add_net_report_log_raw_v2() {
+    __asm {
+        xor eax, eax
+        ret 8
+    }
+}
+
+ 
+static void diag_dump_ac() {
+    uint32_t base = g_netc_base;
+    if (!base) { mta_logf("diag", "no netc base"); return; }
+
+    // 1. AddNetReportLogRaw @ RVA 0x666E0 - first 96 bytes
+    __try {
+        uint32_t fn = base + 0x666E0;
+        for (int i = 0; i < 96; i += 16) {
+            mta_logf("diag", "RepRaw+%02X: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                i,
+                *(uint8_t*)(fn+i+0),  *(uint8_t*)(fn+i+1),  *(uint8_t*)(fn+i+2),  *(uint8_t*)(fn+i+3),
+                *(uint8_t*)(fn+i+4),  *(uint8_t*)(fn+i+5),  *(uint8_t*)(fn+i+6),  *(uint8_t*)(fn+i+7),
+                *(uint8_t*)(fn+i+8),  *(uint8_t*)(fn+i+9),  *(uint8_t*)(fn+i+10), *(uint8_t*)(fn+i+11),
+                *(uint8_t*)(fn+i+12), *(uint8_t*)(fn+i+13), *(uint8_t*)(fn+i+14), *(uint8_t*)(fn+i+15));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { mta_logf("diag", "RepRaw AV"); }
+
+    // 2. push "CCommsRouter::Send" @ RVA 0x6EBAB - 160 bytes around
+    __try {
+        uint32_t push = base + 0x6EBAB;
+        for (int i = -64; i < 96; i += 16) {
+            mta_logf("diag", "SendPush%+03d: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                i,
+                *(uint8_t*)(push+i+0),  *(uint8_t*)(push+i+1),  *(uint8_t*)(push+i+2),  *(uint8_t*)(push+i+3),
+                *(uint8_t*)(push+i+4),  *(uint8_t*)(push+i+5),  *(uint8_t*)(push+i+6),  *(uint8_t*)(push+i+7),
+                *(uint8_t*)(push+i+8),  *(uint8_t*)(push+i+9),  *(uint8_t*)(push+i+10), *(uint8_t*)(push+i+11),
+                *(uint8_t*)(push+i+12), *(uint8_t*)(push+i+13), *(uint8_t*)(push+i+14), *(uint8_t*)(push+i+15));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { mta_logf("diag", "SendPush AV"); }
+
+    // 3. IAT of WS2_32 imports @ RVA 0x404464 - first 24 entries (96 bytes)
+    __try {
+        uint32_t iat = base + 0x404464;
+        for (int i = 0; i < 96; i += 4) {
+            uint32_t v = *(uint32_t*)(iat + i);
+            mta_logf("diag", "IAT[%02X] = %08X", i, v);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { mta_logf("diag", "IAT AV"); }
+}
+
 struct PatchRecord {
     void*   addr;
     uint8_t original[5];
     void*   detour;
 };
 
-static PatchRecord g_patches[64];
+static PatchRecord g_patches[96];
 static int         g_patch_count = 0;
 
 static volatile LONG g_watchdog_stop = 0;
@@ -176,8 +247,7 @@ static bool patch_jmp(void* addr, T detour, T& original_out) {
     if (!VirtualProtect(addr, 5, PAGE_EXECUTE_READWRITE, &old))
         return false;
 
-    // Salva os bytes originais + o detour (para watchdog re-patchar)
-    if (g_patch_count < 64) {
+    if (g_patch_count < 96) {
         g_patches[g_patch_count].addr = addr;
         memcpy(g_patches[g_patch_count].original, addr, 5);
         g_patches[g_patch_count].detour = (void*)detour;
@@ -209,14 +279,15 @@ static void unpatch_all() {
 
 static DWORD WINAPI watchdog_thread(LPVOID) {
     while (InterlockedCompareExchange(&g_watchdog_stop, 0, 0) == 0) {
-        Sleep(2);
-
+        Sleep(16);
+        // netc pinned: park/rebase are no-ops, so g_netc_needs_reinstall
+        // stays false and g_switch_park_until stays 0 for the process life.
+        // Watchdog always runs — no early-continue, no cold frames.
         for (int i = 0; i < g_patch_count; ++i) {
             __try {
                 PatchRecord& pr = g_patches[i];
                 uint8_t* bytes = (uint8_t*)pr.addr;
 
-                // Se o primeiro byte não é 0xE9, o hook foi removido/sobrescrito
                 if (bytes[0] != 0xE9) {
                     bool matched_original = (memcmp(pr.addr, pr.original, 5) == 0);
 
@@ -279,6 +350,8 @@ static uint32_t      g_switch_park_until   = 0;
 static bool          g_switch_rebase_seen  = false;
 
 static void silent_retire_hooks();
+static void silent_install_hook();
+static void silent_install_mid_hooks();
 static void reconnect_note(uint32_t);
 static void mta_logf(const char* tag, const char* fmt, ...);
 
@@ -298,14 +371,12 @@ static void emergency_disable_all();
 static void fly_physics_end();
 static void rapid_fire_restore();
 
-static uint32_t      g_netc_base          = 0;
-static uint32_t      g_netc_size          = 0;
 static bool          g_netc_rebase_logged = false;
 static bool          g_netc_unload_logged = false;
 static bool          g_netc_needs_reinstall = false;
-static uint8_t       g_stale_patch_sink[64][8] = {};
+static uint8_t       g_stale_patch_sink[96][8] = {};
 
-static PatchRecord   g_quit_flush[64]         = {};
+static PatchRecord   g_quit_flush[96]         = {};
 static int           g_quit_flush_count       = 0;
 static bool          g_quit_flushed           = false;
 static volatile LONG g_shutdown_all           = 0;
@@ -317,7 +388,7 @@ static void quit_flush() {
     g_quit_flushed = true;
     g_quit_flush_count = 0;
     int w = 0;
-    for (int i = 0; i < g_patch_count && i < 64; ++i) {
+    for (int i = 0; i < g_patch_count && i < 96; ++i) {
         PatchRecord pr = g_patches[i];
         uint32_t a = (uint32_t)(uintptr_t)pr.addr;
         if (a >= g_netc_base && a < g_netc_base + g_netc_size) {
@@ -329,18 +400,22 @@ static void quit_flush() {
                     FlushInstructionCache(GetCurrentProcess(), pr.addr, 5);
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) { }
-            if (g_quit_flush_count < 64) g_quit_flush[g_quit_flush_count++] = pr;
+            if (g_quit_flush_count < 96) g_quit_flush[g_quit_flush_count++] = pr;
         } else {
             if (w != i) g_patches[w] = pr;
             ++w;
         }
     }
     g_patch_count = w;
+    // Ordem de saida: game_sa (silent/trajetoria) PRIMEIRO, netc POR ULTIMO.
+    // g_patches agora so contem entradas fora de [g_netc_base, +size),
+    // que na pratica e vazio — os netc ficaram em g_quit_flush para
+    // restauracao final no DllMain. silent_retire_hooks() cobre game_sa.
     silent_retire_hooks();
     InterlockedExchange(&g_session_live, 0);
     InterlockedExchange(&g_silent_send_ok, 0);
-    mta_logf("quit", "flush antes do Unload: %d hooks do netc restaurados, trajetoria retirada, watchdog sem alvos",
-             g_quit_flush_count);
+    mta_logf("quit", "flush: game_sa retirado (%d hooks netc guardados p/ ultimo), %d patches restantes",
+             g_quit_flush_count, g_patch_count);
 }
 
 static void quit_unflush() {
@@ -360,7 +435,7 @@ static void quit_unflush() {
                 FlushInstructionCache(GetCurrentProcess(), pr.addr, 5);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        if (g_patch_count < 64) g_patches[g_patch_count++] = pr;
+        if (g_patch_count < 96) g_patches[g_patch_count++] = pr;
     }
     g_quit_flush_count = 0;
     mta_logf("quit", "flush revertido: janela reapareceu, hooks religados sem novos trampolins");
@@ -379,89 +454,33 @@ static uint32_t netc_image_size(HMODULE mod) {
 }
 
 static void netc_retire_stale_patches(uint32_t new_base, uint32_t new_size) {
-    if (!g_netc_base || !g_netc_size) return;
-    __try {
-        for (int i = 0; i < g_patch_count && i < 64; ++i) {
-            PatchRecord& pr = g_patches[i];
-            uint32_t a = (uint32_t)(uintptr_t)pr.addr;
-            if (!a || a < g_netc_base || a >= g_netc_base + g_netc_size) continue;
-            if (new_base && new_size && a >= new_base && a < new_base + new_size) continue;
-            memset(g_stale_patch_sink[i], 0xE9, sizeof(g_stale_patch_sink[i]));
-            pr.addr = g_stale_patch_sink[i];
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    (void)new_base; (void)new_size;
+    // netc pinned: never retire. Patches stay on the original map.
 }
 
 static void install_all();
 
-static PatchRecord   g_park_netc[64]       = {};
+static PatchRecord   g_park_netc[96]       = {};
 static int           g_park_netc_count     = 0;
 static uint32_t      g_park_netc_base      = 0;
 
 static void park_netc_hooks() {
-    if (g_park_netc_count) return;
-    if (!g_netc_base || !g_netc_size) return;
-    g_park_netc_base = g_netc_base;
-    for (int i = 0; i < g_patch_count && i < 64; ++i) {
-        uint32_t a = (uint32_t)(uintptr_t)g_patches[i].addr;
-        if (a >= g_netc_base && a < g_netc_base + g_netc_size &&
-            g_park_netc_count < 64)
-            g_park_netc[g_park_netc_count++] = g_patches[i];
-    }
-    silent_retire_hooks();
-    mta_logf("safe", "troca de servidor: %d validadores do netc mantidos, hooks de trajetoria retirados",
-             g_park_netc_count);
+    // netc pinned: park is a no-op. Patches stay live across server switch.
 }
 
 static void unpark_netc_hooks() {
-    int restored = 0;
-    for (int i = 0; i < g_park_netc_count; ++i) {
-        PatchRecord pr = g_park_netc[i];
-        __try {
-            uint8_t* p = (uint8_t*)pr.addr;
-            if (p[0] == 0xE9) continue;
-            DWORD oldp = 0;
-            if (VirtualProtect(pr.addr, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
-                p[0] = 0xE9;
-                *(int32_t*)(p + 1) = (int32_t)((uintptr_t)pr.detour - (uintptr_t)pr.addr - 5);
-                VirtualProtect(pr.addr, 5, oldp, &oldp);
-                FlushInstructionCache(GetCurrentProcess(), pr.addr, 5);
-                ++restored;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    }
-    g_park_netc_count = 0;
-    mta_logf("safe", "troca de servidor: %d validadores reconfirmados sem novos trampolins",
-             restored);
+    // netc pinned: unpark is a no-op. Nothing was parked.
 }
 
 static void arm_switch_park(uint32_t now) {
     uint32_t t = now ? now : 1;
-    if (g_netc_needs_reinstall) return;
-    if (g_switch_park_until && (int32_t)(g_switch_park_until - t) > 0) return;
-    park_netc_hooks();
-    g_switch_park_until = t + SWITCH_PARK_MS;
-    g_netc_needs_reinstall = true;
-    g_switch_rebase_seen = false;
     reconnect_note(t);
+    // netc pinned: never park, never set needs_reinstall.
 }
 
 static void netc_rebase_patches(uint32_t new_base, uint32_t new_size) {
-    if (!new_base || !new_size) return;
-    if (new_base != g_netc_base) {
-        int w = 0;
-        for (int i = 0; i < g_patch_count && i < 64; ++i) {
-            uint32_t a = (uint32_t)(uintptr_t)g_patches[i].addr;
-            if (a >= g_netc_base && a < g_netc_base + g_netc_size) continue;
-            if (w != i) g_patches[w] = g_patches[i];
-            ++w;
-        }
-        g_patch_count = w;
-        g_park_netc_count = 0;
-    }
-    g_netc_base = new_base;
-    g_netc_size = new_size;
-    g_netc_needs_reinstall = true;
+    (void)new_base; (void)new_size;
+    // netc pinned: never rebase. Base is set once at boot, patches point there.
 }
 
 static bool g_cursor_hidden = false;
@@ -535,16 +554,29 @@ static void mta_logf(const char* tag, const char* fmt, ...) {
     InterlockedExchange(&g_log_busy, 0);
 }
 
-static const ImU32 COL_ACCENT      = IM_COL32(136, 100, 255, 255);
-static const ImU32 COL_ACCENT_DIM  = IM_COL32(136, 100, 255, 60);
-static const ImU32 COL_ACCENT_SOFT = IM_COL32(160, 130, 255, 255);
-static const ImU32 COL_BG_PANEL    = IM_COL32(12, 12, 14, 245);
-static const ImU32 COL_BG_HEADER   = IM_COL32(20, 20, 26, 255);
-static const ImU32 COL_BG_SIDEBAR  = IM_COL32(16, 16, 20, 255);
-static const ImU32 COL_BG_CARD     = IM_COL32(18, 18, 24, 255);
-static const ImU32 COL_BORDER      = IM_COL32(40, 40, 50, 255);
-static const ImU32 COL_TEXT        = IM_COL32(230, 230, 235, 255);
-static const ImU32 COL_TEXT_DIM    = IM_COL32(120, 120, 130, 255);
+static const ImVec4 SCHEME_V        = ImVec4(242 / 255.f, 32 / 255.f, 51 / 255.f, 1.0f);
+static const ImVec4 SCHEME_HOVER_V  = ImVec4(206 / 255.f, 27 / 255.f, 43 / 255.f, 1.0f);
+static const ImVec4 SCHEME_ACTIVE_V = ImVec4(181 / 255.f, 24 / 255.f, 38 / 255.f, 1.0f);
+static const ImVec4 WARN_V          = ImVec4(255 / 255.f, 131 / 255.f, 17 / 255.f, 1.0f);
+static const ImU32 COL_SCHEME       = IM_COL32(242, 32, 51, 255);
+static const ImU32 COL_SCHEME_HOVER = IM_COL32(206, 27, 43, 255);
+static const ImU32 COL_SCHEME_ACT   = IM_COL32(181, 24, 38, 255);
+static const ImU32 COL_ACCENT       = COL_SCHEME;
+static const ImU32 COL_ACCENT_DIM   = IM_COL32(242, 32, 51, 60);
+static const ImU32 COL_ACCENT_SOFT  = IM_COL32(255, 92, 106, 255);
+static const ImU32 COL_BG_PANEL     = IM_COL32(20, 20, 21, 255);
+static const ImU32 COL_BG_HEADER    = IM_COL32(20, 20, 21, 255);
+static const ImU32 COL_BG_SIDEBAR   = IM_COL32(26, 26, 28, 255);
+static const ImU32 COL_BG_CARD      = IM_COL32(26, 26, 28, 255);
+static const ImU32 COL_FRAME_BG     = IM_COL32(35, 35, 38, 255);
+static const ImU32 COL_FRAME_HOVER  = IM_COL32(45, 45, 49, 255);
+static const ImU32 COL_FRAME_ACTIVE = IM_COL32(54, 54, 58, 255);
+static const ImU32 COL_TOGGLE_OFF   = IM_COL32(52, 52, 56, 255);
+static const ImU32 COL_TOGGLE_KNOB  = IM_COL32(150, 151, 156, 255);
+static const ImU32 COL_BORDER       = IM_COL32(255, 255, 255, 8);
+static const ImU32 COL_TEXT         = IM_COL32(205, 205, 208, 255);
+static const ImU32 COL_TEXT_DIM     = IM_COL32(128, 129, 134, 255);
+static const float UI_ANIM_SPEED    = 0.12f;
 
 enum MenuTab {
     TAB_COMBAT = 0,
@@ -559,8 +591,9 @@ static bool  g_prev_insert     = false;
 static bool  g_prev_menu_open  = false;
 
 static int   g_current_tab     = TAB_VISUALS;
-static int   g_anim_tab        = TAB_VISUALS;
-static float g_tab_alpha       = 1.0f;
+static int   g_next_tab        = TAB_VISUALS;
+static float g_content_anim      = 1.0f;
+static float g_content_anim_dest = 1.0f;
 
 static ImVec2 g_menu_pos       = ImVec2(0, 0);
 static ImVec2 g_menu_size      = ImVec2(640, 420);
@@ -568,6 +601,8 @@ static ImVec2 g_menu_size      = ImVec2(640, 420);
 static bool  g_esp_local_enable  = false;
 static bool  g_esp_local_box     = false;
 static bool  g_esp_local_box_filled = false;
+static bool  g_esp_local_box_corner = false;
+static bool  g_esp_local_box_rounded = false;
 static bool  g_esp_local_lines   = false;
 static bool  g_esp_local_names   = false;
 static bool  g_esp_local_health  = false;
@@ -587,6 +622,8 @@ static float g_col_local_distance[3] = { 1.0f, 1.0f, 1.0f };
 static bool  g_esp_players_enable  = false;
 static bool  g_esp_players_box     = false;
 static bool  g_esp_players_box_filled = false;
+static bool  g_esp_players_box_corner = false;
+static bool  g_esp_players_box_rounded = false;
 static bool  g_esp_players_lines   = false;
 static bool  g_esp_players_names   = false;
 static bool  g_esp_players_health  = false;
@@ -611,6 +648,10 @@ static float g_col_players_distance[3] = { 1.0f, 1.0f, 1.0f };
 #define ESP_SHOW_UNRESOLVED_NAME 0
 
 #define ESP_SKELETON_THICKNESS  1.0f
+
+// (corner/rounded agora sao por-card: g_esp_local_box_corner/rounded e
+//  g_esp_players_box_corner/rounded. Declarados acima junto com os
+//  demais bools de cada card.)
 
 static bool session_live() {
     if (InterlockedCompareExchange(&g_shutdown_all, 0, 0)) return false;
@@ -674,7 +715,7 @@ static bool     g_rf_src_fn       = false;
 static float    g_rf_last_window  = 0.0f;
 static uint32_t g_rf_rewrites     = 0;
 static bool  g_fly_active       = false;
-static float g_fly_speed        = 12.0f;
+static float g_fly_speed        = 8.0f;
 static int   g_fly_mode         = FLY_MODE_HOLD;
 static float g_fly_pitch_base   = 0.0f;
 static bool  g_fly_pitch_init   = false;
@@ -689,12 +730,17 @@ static uint32_t g_fly_phys_ped    = 0;
 static float g_fly_hp_saved       = 100.0f;
 static float g_fly_armor_saved    = 0.0f;
 static int   g_fly_axis_idx       = -1;
-
+static bool  g_infinite_ammo      = false;
+static bool  g_fly_car            = false;
+static bool  g_ammo_logged        = false;
+static bool  g_flycar_logged      = false;
+static bool  g_fly_veh_logged     = false;
 
 #define WDA_NONE_VALUE            0x00000000
 #define WDA_MONITOR_VALUE         0x00000001
 #define WDA_EXCLUDEFROMCAPTURE_V  0x00000011
-static bool     g_stream_proof         = true;   // default ON: WDA_EXCLUDEFROMCAPTURE no boot
+static bool     g_stream_proof         = false;
+static bool     g_game_focused         = true;
 static bool     g_stream_proof_ok      = true;
 static bool     g_stream_proof_ready   = false;
 static DWORD    g_stream_proof_applied = WDA_NONE_VALUE;
@@ -959,6 +1005,39 @@ static bool conn_handshake_active() {
 #endif
 #define TROLL_ICON_GLYPH "\xEF\x96\x88"
 
+#define ADDR_EXPLOSION_ADD      0x736A50
+#define ADDR_CAMERA_TARGET_PED  0xB6F3B0
+#define EXPLOSION_GRENADE       0
+#define EXPLOSION_MOLOTOV       1
+#define TROLL_EXPLODE_RADIUS    4.0f
+#define TROLL_FIRE_RADIUS       4.5f
+
+#ifdef ICON_FA_CROSSHAIRS
+#define CARD_ICON_CROSSHAIR ICON_FA_CROSSHAIRS
+#else
+#define CARD_ICON_CROSSHAIR "\xEF\x81\x9B"
+#endif
+#ifdef ICON_FA_GHOST
+#define CARD_ICON_GHOST     ICON_FA_GHOST
+#else
+#define CARD_ICON_GHOST     "\xEF\x9B\xA2"
+#endif
+#ifdef ICON_FA_EYE
+#define CARD_ICON_EYE       ICON_FA_EYE
+#else
+#define CARD_ICON_EYE       "\xEF\x81\xAE"
+#endif
+#ifdef ICON_FA_COG
+#define CARD_ICON_COG       ICON_FA_COG
+#else
+#define CARD_ICON_COG       "\xEF\x80\x93"
+#endif
+#ifdef ICON_FA_BOLT
+#define CARD_ICON_BOLT      ICON_FA_BOLT
+#else
+#define CARD_ICON_BOLT      "\xEF\x83\xA7"
+#endif
+
 static int      g_aimbot_key_vk       = VK_XBUTTON1;
 static char     g_aimbot_key_name[32] = "Mouse4";
 static bool     g_aimbot_key_is_mouse = true;
@@ -1131,6 +1210,7 @@ static void aimbot_update_key() {
 }
 
 static ImFont* g_font_regular   = nullptr;
+static ImFont* g_font_tabs      = nullptr;
 static ImFont* g_font_header    = nullptr;
 static ImFont* g_font_esp_name  = nullptr;
 static ImFont* g_font_icons     = nullptr;
@@ -1143,6 +1223,8 @@ static const CfgEntry CFG_ENTRIES[] = {
     { "esp.local.enable",     &g_esp_local_enable,     CFG_BOOL  },
     { "esp.local.box",        &g_esp_local_box,        CFG_BOOL  },
     { "esp.local.filled",     &g_esp_local_box_filled, CFG_BOOL  },
+    { "esp.local.corner",     &g_esp_local_box_corner, CFG_BOOL  },
+    { "esp.local.rounded",    &g_esp_local_box_rounded,CFG_BOOL  },
     { "esp.local.lines",      &g_esp_local_lines,      CFG_BOOL  },
     { "esp.local.names",      &g_esp_local_names,      CFG_BOOL  },
     { "esp.local.health",     &g_esp_local_health,     CFG_BOOL  },
@@ -1160,6 +1242,8 @@ static const CfgEntry CFG_ENTRIES[] = {
     { "esp.players.enable",   &g_esp_players_enable,   CFG_BOOL  },
     { "esp.players.box",      &g_esp_players_box,      CFG_BOOL  },
     { "esp.players.filled",   &g_esp_players_box_filled, CFG_BOOL },
+    { "esp.players.corner",   &g_esp_players_box_corner, CFG_BOOL },
+    { "esp.players.rounded",  &g_esp_players_box_rounded,CFG_BOOL },
     { "esp.players.lines",    &g_esp_players_lines,    CFG_BOOL  },
     { "esp.players.names",    &g_esp_players_names,    CFG_BOOL  },
     { "esp.players.health",   &g_esp_players_health,   CFG_BOOL  },
@@ -1200,6 +1284,8 @@ static const CfgEntry CFG_ENTRIES[] = {
     { "misc.streamproof",     &g_stream_proof,         CFG_BOOL  },
     { "troll.rapidfire",      &g_rapid_fire_enable,    CFG_BOOL  },
     { "troll.firerate",       &g_rapid_fire_rate,      CFG_FLOAT },
+    { "troll.infiniteammo",   &g_infinite_ammo,        CFG_BOOL  },
+    { "troll.flycar",         &g_fly_car,              CFG_BOOL  },
 };
 static const int CFG_ENTRY_COUNT = (int)(sizeof(CFG_ENTRIES) / sizeof(CFG_ENTRIES[0]));
 
@@ -1299,7 +1385,7 @@ static bool cfg_load(const char* name) {
     g_silent_bone     = g_silent_bone < 0 ? 0 : (g_silent_bone > 6 ? 6 : g_silent_bone);
     if (g_silent_key_vk <= 0 || g_silent_key_vk > 255) g_silent_key_vk = VK_XBUTTON2;
     bind_format_key(g_silent_key_vk, g_silent_key_name, sizeof(g_silent_key_name));
-    g_fly_speed       = cfg_clampf(g_fly_speed, 1.0f, 60.0f);
+    g_fly_speed       = cfg_clampf(g_fly_speed, 0.5f, 20.0f);
     g_rapid_fire_rate = cfg_clampf(g_rapid_fire_rate, 1.0f, 100.0f);
     if (g_menu_key_vk <= 0 || g_menu_key_vk > 255) g_menu_key_vk = VK_INSERT;
     if (g_fly_key_vk  <= 0 || g_fly_key_vk  > 255) g_fly_key_vk  = VK_F8;
@@ -1338,15 +1424,62 @@ static const char* g_notify_icon   = nullptr;
 static bool     g_notify_ok        = true;
 static uint32_t g_notify_tick      = 0;
 static float    g_notify_anim      = 0.0f;
-static float    g_tab_slide        = 0.0f;
-static float    g_tab_dir          = 1.0f;
-static float    g_hover_anim       = 0.0f;
+static std::unordered_map<ImGuiID, float> g_sub_h;
 static char     g_troll_names[64][48] = {};
 static int      g_troll_count      = 0;
 static char     g_troll_selected_name[48] = {};
+static char     g_troll_submenu_name[48]  = {};
+static bool     g_troll_submenu_open      = false;
+static uint32_t g_troll_submenu_ped       = 0;
+static bool     g_spectate_active         = false;
+static uint32_t g_spectate_ped            = 0;
 static std::unordered_map<ImGuiID, float> g_sub_anim;
 static std::unordered_map<ImGuiID, float> g_slider_anim;
 static std::unordered_map<ImGuiID, float> g_btn_anim;
+
+static float ui_anim(const char* label, int seed, bool state, float lo, float hi, float speed) {
+    static std::unordered_map<ImGuiID, float> values;
+    ImGuiID id = ImHashStr(label, 0, (ImU32)seed);
+    if (values.find(id) == values.end()) values[id] = lo;
+    float& v = values[id];
+    float step = speed * (1.0f - ImGui::GetIO().DeltaTime);
+    if (step < 0.0f) step = 0.0f;
+    if (step > 1.0f) step = 1.0f;
+    v = ImLerp(v, state ? hi : lo, step);
+    return v;
+}
+
+static ImU32 ui_color_lerp(ImU32 from, ImU32 to, float t) {
+    if (t <= 0.0f) return from;
+    if (t >= 1.0f) return to;
+    return ImGui::GetColorU32(ImLerp(ImGui::ColorConvertU32ToFloat4(from),
+                                     ImGui::ColorConvertU32ToFloat4(to), t));
+}
+
+static ImU32 ui_col_a(ImU32 col, float a) {
+    ImVec4 v = ImGui::ColorConvertU32ToFloat4(col);
+    v.w *= ImClamp(a, 0.0f, 1.0f);
+    return ImGui::GetColorU32(v);
+}
+
+static const char* ui_combo_item(const char* items, int idx) {
+    if (!items || idx < 0) return "";
+    const char* p = items;
+    for (int i = 0; i < idx; ++i) {
+        while (*p) ++p;
+        ++p;
+        if (!*p) return "";
+    }
+    return p;
+}
+
+static void ui_tooltip(const char* text) {
+    if (!text || !text[0]) return;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+    ImGui::SetTooltip("%s", text);
+    ImGui::PopStyleVar();
+}
+
 
 static void notify_push(const char* title, const char* icon, bool ok,
                         const char* fmt, ...) {
@@ -1361,6 +1494,8 @@ static void notify_push(const char* title, const char* icon, bool ok,
     g_notify_anim = 0.0f;
 }
 
+static void draw_check_v(ImDrawList* dl, const ImRect& b, float t);
+
 static void notify_draw() {
     if (!g_notify_tick || InterlockedCompareExchange(&g_shutdown_all, 0, 0)) return;
     ImGuiIO& io = ImGui::GetIO();
@@ -1369,23 +1504,15 @@ static void notify_draw() {
     g_notify_anim += (target - g_notify_anim) * ImMin(1.0f, 10.0f * io.DeltaTime);
     if (target == 0.0f && g_notify_anim < 0.003f) { g_notify_tick = 0; g_notify_anim = 0.0f; return; }
     float a = ImClamp(g_notify_anim, 0.0f, 1.0f);
-    ImVec2 ts = ImGui::CalcTextSize(g_notify_title);
-    ImVec2 ds = ImGui::CalcTextSize(g_notify_text);
-    float fs = g_icon_font_size * 0.9f;
-    ImVec2 is = ImVec2(0, 0);
-    bool has_icon = (g_font_icons && g_notify_icon && g_notify_icon[0]);
-    if (has_icon) is = g_font_icons->CalcTextSizeA(fs, FLT_MAX, 0.0f, g_notify_icon);
-    float icon_w = has_icon ? is.x + 12.0f : 20.0f;
-    float w = icon_w + ImMax(ts.x, ds.x) + 26.0f;
-    float h = 52.0f;
-    float r = h * 0.5f;
-    ImVec2 pos(io.DisplaySize.x - 18.0f, io.DisplaySize.y - 18.0f + (1.0f - a) * 20.0f);
-    ImGui::SetNextWindowPos(pos, ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    const float w = 280.0f;
+    const float h = 50.0f;
+    ImVec2 pos(io.DisplaySize.x - 298.0f, 30.0f - (1.0f - a) * 24.0f);
+    ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, a);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, r);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ImGui::GetStyle().FrameRounding);
     ImGui::Begin("##notify", nullptr,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1395,45 +1522,51 @@ static void notify_draw() {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 p0 = ImGui::GetWindowPos();
     ImVec2 p1(p0.x + w, p0.y + h);
-    dl->AddRectFilled(p0, p1, IM_COL32(18, 18, 24, (int)(245.0f * a)), r);
-    dl->AddRect(p0, p1, IM_COL32(136, 100, 255, (int)(255.0f * a)), r, 0, 1.2f);
-    ImU32 ic = g_notify_ok ? IM_COL32(160, 130, 255, (int)(255.0f * a))
-                           : IM_COL32(255, 140, 140, (int)(255.0f * a));
-    ImU32 tc = ic;
-    ImU32 dc = g_notify_ok ? IM_COL32(215, 215, 225, (int)(235.0f * a))
-                           : IM_COL32(255, 175, 175, (int)(235.0f * a));
-    if (has_icon) {
-        dl->AddText(g_font_icons, fs,
-            ImVec2(p0.x + 14.0f, p0.y + (h - is.y) * 0.5f), ic, g_notify_icon);
+    float rr = ImGui::GetStyle().FrameRounding;
+    dl->AddRectFilled(p0, p1, ui_col_a(COL_FRAME_BG, a), rr);
+    ImVec4 st = g_notify_ok ? SCHEME_V : WARN_V;
+    st.w = a;
+    dl->AddRectFilled(p0, ImVec2(p0.x + 50.0f, p1.y), ImGui::GetColorU32(st), rr,
+                      ImDrawFlags_RoundCornersLeft);
+    if (g_notify_ok) {
+        ImRect mk(ImVec2(p0.x + 13.0f, p0.y + 13.0f), ImVec2(p0.x + 37.0f, p0.y + 37.0f));
+        draw_check_v(dl, mk, a);
     } else {
-        dl->AddCircleFilled(ImVec2(p0.x + 18.0f, p0.y + h * 0.5f), 5.0f, ic);
+        ImVec2 c(p0.x + 25.0f, p0.y + 25.0f);
+        ImU32 wc = ui_col_a(IM_COL32(255, 255, 255, 255), a);
+        dl->AddLine(ImVec2(c.x - 6.0f, c.y - 6.0f), ImVec2(c.x + 6.0f, c.y + 6.0f), wc, 2.0f);
+        dl->AddLine(ImVec2(c.x + 6.0f, c.y - 6.0f), ImVec2(c.x - 6.0f, c.y + 6.0f), wc, 2.0f);
     }
-    float tx = p0.x + icon_w + 10.0f;
-    dl->AddText(ImVec2(tx, p0.y + 9.0f), tc, g_notify_title);
-    dl->AddText(ImVec2(tx, p0.y + 28.0f), dc, g_notify_text);
+    dl->AddText(ImVec2(p0.x + 64.0f, p0.y + 9.0f),
+                ui_col_a(IM_COL32(255, 255, 255, 255), a), g_notify_title);
+    dl->AddText(ImVec2(p0.x + 64.0f, p0.y + 28.0f), ui_col_a(COL_TEXT, a), g_notify_text);
     ImGui::End();
     ImGui::PopStyleVar(4);
 }
 
 static void draw_check_v(ImDrawList* dl, const ImRect& b, float t) {
     if (t <= 0.01f) return;
-    ImVec2 p1(b.Min.x + 3.8f, b.Min.y + b.GetHeight() * 0.52f);
-    ImVec2 p2(b.Min.x + b.GetWidth() * 0.44f, b.Max.y - 3.8f);
-    ImVec2 p3(b.Max.x - 3.4f, b.Min.y + 4.0f);
-    ImU32 col = IM_COL32(245, 245, 250, (int)(t * 255));
+    ImVec2 p1(b.Min.x + b.GetWidth() * 0.24f, b.Min.y + b.GetHeight() * 0.54f);
+    ImVec2 p2(b.Min.x + b.GetWidth() * 0.42f, b.Min.y + b.GetHeight() * 0.74f);
+    ImVec2 p3(b.Min.x + b.GetWidth() * 0.78f, b.Min.y + b.GetHeight() * 0.30f);
+    ImU32 col = IM_COL32(250, 250, 252, (int)(t * 255));
     float a = ImMin(1.0f, t * 2.0f);
     float c = ImClamp(t * 2.0f - 1.0f, 0.0f, 1.0f);
-    dl->AddLine(p1, ImVec2(p1.x + (p2.x - p1.x) * a, p1.y + (p2.y - p1.y) * a), col, 2.0f);
+    dl->AddLine(p1, ImVec2(p1.x + (p2.x - p1.x) * a, p1.y + (p2.y - p1.y) * a), col, 2.2f);
     if (c > 0.0f)
-        dl->AddLine(p2, ImVec2(p2.x + (p3.x - p2.x) * c, p2.y + (p3.y - p2.y) * c), col, 2.0f);
+        dl->AddLine(p2, ImVec2(p2.x + (p3.x - p2.x) * c, p2.y + (p3.y - p2.y) * c), col, 2.2f);
 }
 
-static void draw_check_glow(ImDrawList* dl, const ImRect& b, float anim, bool hovered) {
-    if (anim <= 0.01f) return;
-    float expand = hovered ? 2.6f : 1.8f;
-    dl->AddRectFilled(ImVec2(b.Min.x - expand, b.Min.y - expand),
-                      ImVec2(b.Max.x + expand, b.Max.y + expand),
-                      IM_COL32(136, 100, 255, (int)(10.0f * anim)), 6.0f);
+static void draw_toggle(ImDrawList* dl, const ImRect& bb, float anim, bool hovered, bool held) {
+    const float r = bb.GetHeight() * 0.5f;
+    ImU32 track = ui_color_lerp(hovered ? COL_FRAME_ACTIVE : COL_TOGGLE_OFF, COL_SCHEME, anim);
+    dl->AddRectFilled(bb.Min, bb.Max, track, r);
+    if (held)
+        dl->AddRect(bb.Min, bb.Max, ui_col_a(COL_SCHEME, 0.65f), r, 0, 1.0f);
+    float kx = bb.Min.x + r + anim * (bb.GetWidth() - bb.GetHeight());
+    ImVec2 cen(kx, bb.GetCenter().y);
+    dl->AddCircleFilled(cen, r - 2.0f,
+                        ui_color_lerp(COL_TOGGLE_KNOB, IM_COL32(255, 255, 255, 255), anim));
 }
 
 static bool accent_checkbox(const char* label, bool* v) {
@@ -1443,10 +1576,11 @@ static bool accent_checkbox(const char* label, bool* v) {
     ImGui::PushID(label);
     ImGuiContext& g = *GImGui;
     const ImGuiStyle& style = g.Style;
-    const ImGuiID id = window->GetID(label);
+    const ImGuiID id = window->GetID("##cb");
     const ImVec2 label_size = ImGui::CalcTextSize(label, NULL, true);
-    const float box_size = 17.0f;
-    const float height = ImMax(box_size, label_size.y);
+    const float box_size = 36.0f;
+    const float box_h    = 18.0f;
+    const float height = ImMax(box_h, label_size.y);
     const float total_w = box_size + (label_size.x > 0.0f ? style.ItemInnerSpacing.x + label_size.x : 0.0f);
     ImVec2 pos = window->DC.CursorPos;
     ImRect total_bb(pos, ImVec2(pos.x + total_w, pos.y + height));
@@ -1456,18 +1590,12 @@ static bool accent_checkbox(const char* label, bool* v) {
     bool pressed = ImGui::ButtonBehavior(total_bb, id, &hovered, &held);
     if (pressed) { *v = !*v; ImGui::MarkItemEdited(id); }
     float& anim = g_check_anim[id];
-    float target = *v ? 1.0f : 0.0f;
-    anim += (target - anim) * ImMin(1.0f, 14.0f * g.IO.DeltaTime);
+    anim += ((*v ? 1.0f : 0.0f) - anim) * ImMin(1.0f, 14.0f * g.IO.DeltaTime);
     if (anim < 0.001f) anim = 0.0f;
     if (anim > 0.999f) anim = 1.0f;
-    ImRect box_bb(pos, ImVec2(pos.x + box_size, pos.y + box_size));
-    ImDrawList* dl = window->DrawList;
-    draw_check_glow(dl, box_bb, anim, hovered);
-    if (anim > 0.01f)
-        dl->AddRectFilled(box_bb.Min, box_bb.Max, IM_COL32(136, 100, 255, (int)(anim * 255)), 4.0f);
-    dl->AddRect(box_bb.Min, box_bb.Max,
-        anim > 0.01f ? IM_COL32(136, 100, 255, 255) : IM_COL32(92, 92, 106, 255), 4.0f, 0, 1.2f);
-    draw_check_v(dl, box_bb, anim);
+    ImRect box_bb(ImVec2(pos.x, pos.y + (height - box_h) * 0.5f),
+                  ImVec2(pos.x + box_size, pos.y + (height + box_h) * 0.5f));
+    draw_toggle(window->DrawList, box_bb, anim, hovered, held);
     if (label_size.x > 0.0f)
         ImGui::RenderText(ImVec2(box_bb.Max.x + style.ItemInnerSpacing.x,
                                  pos.y + (height - label_size.y) * 0.5f), label);
@@ -1476,77 +1604,198 @@ static bool accent_checkbox(const char* label, bool* v) {
     return pressed;
 }
 
+static int ui_hex_parse(const char* s, unsigned* out, int n) {
+    int k = 0;
+    unsigned cur = 0;
+    int digits = 0;
+    for (const char* p = s; *p && k < n; ++p) {
+        unsigned d;
+        char c = *p;
+        if (c >= '0' && c <= '9')      d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else continue;
+        cur = cur * 16u + d;
+        if (++digits == 2) { out[k++] = cur; cur = 0; digits = 0; }
+    }
+    return k;
+}
+
+static void ui_color_picker(float* col, int comps, float w) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGuiIO& io = ImGui::GetIO();
+    ImDrawList* dl = window->DrawList;
+    const float alpha8 = style.Alpha;
+    bool changed = false;
+
+    float h = 0.0f, s = 0.0f, v = 0.0f;
+    ImGui::ColorConvertRGBtoHSV(col[0], col[1], col[2], h, s, v);
+    h = ImClamp(h, 0.0f, 1.0f);
+    s = ImClamp(s, 0.0f, 1.0f);
+    v = ImClamp(v, 0.0f, 1.0f);
+
+    ImVec4 hue_v(1.0f, 1.0f, 1.0f, alpha8);
+    ImGui::ColorConvertHSVtoRGB(h, 1.0f, 1.0f, hue_v.x, hue_v.y, hue_v.z);
+    ImU32 hue32 = ImGui::GetColorU32(hue_v);
+    ImU32 white = ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, alpha8));
+    ImU32 black = ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, alpha8));
+
+    ImVec2 sp = window->DC.CursorPos;
+    float sq_h = ImMax(20.0f, w * 0.5f);
+    ImRect sq(sp, ImVec2(sp.x + w, sp.y + sq_h));
+    dl->AddRectFilledMultiColor(sq.Min, sq.Max, white, hue32, hue32, white);
+    dl->AddRectFilledMultiColor(sq.Min, sq.Max, 0, 0, black, black);
+    ImVec2 cur(ImClamp(IM_ROUND(sq.Min.x + ImSaturate(s) * sq.GetWidth()), sq.Min.x + 2.0f, sq.Max.x - 2.0f),
+               ImClamp(IM_ROUND(sq.Min.y + ImSaturate(1.0f - v) * sq.GetHeight()), sq.Min.y + 2.0f, sq.Max.y - 2.0f));
+    dl->AddCircleFilled(cur, 4.5f, ImGui::GetColorU32(ImVec4(col[0], col[1], col[2], 1.0f)));
+    dl->AddCircle(cur, 4.5f, white, 0, 1.6f);
+    dl->AddCircle(cur, 5.9f, ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.5f * alpha8)), 0, 1.0f);
+    ImGui::InvisibleButton("##sv", sq.GetSize());
+    if (ImGui::IsItemActive()) {
+        s = ImSaturate((io.MousePos.x - sq.Min.x) / ImMax(1.0f, sq.GetWidth() - 1.0f));
+        v = 1.0f - ImSaturate((io.MousePos.y - sq.Min.y) / ImMax(1.0f, sq.GetHeight() - 1.0f));
+        if (s <= 0.0f) s = 0.01f;
+        if (v <= 0.0f) v = 0.01f;
+        changed = true;
+    }
+    ImGui::Dummy(ImVec2(0, 4));
+
+    const ImU32 hues[7] = {
+        IM_COL32(255, 0, 0, 255), IM_COL32(255, 255, 0, 255), IM_COL32(0, 255, 0, 255),
+        IM_COL32(0, 255, 255, 255), IM_COL32(0, 0, 255, 255), IM_COL32(255, 0, 255, 255),
+        IM_COL32(255, 0, 0, 255)
+    };
+    ImVec2 hp = window->DC.CursorPos;
+    ImRect hb(hp, ImVec2(hp.x + w, hp.y + 8.0f));
+    for (int i = 0; i < 6; ++i)
+        dl->AddRectFilledMultiColor(ImVec2(hb.Min.x + (float)i * (w / 6.0f), hb.Min.y),
+                                    ImVec2(hb.Min.x + (float)(i + 1) * (w / 6.0f), hb.Max.y),
+                                    ui_col_a(hues[i], alpha8), ui_col_a(hues[i + 1], alpha8),
+                                    ui_col_a(hues[i + 1], alpha8), ui_col_a(hues[i], alpha8));
+    dl->AddCircleFilled(ImVec2(hb.Min.x + 4.0f, hb.GetCenter().y), 4.0f, ui_col_a(hues[0], alpha8));
+    dl->AddCircleFilled(ImVec2(hb.Max.x - 4.0f, hb.GetCenter().y), 4.0f, ui_col_a(hues[6], alpha8));
+    float hmx = hb.Min.x + 4.0f + (w - 8.0f) * ImSaturate(h);
+    dl->AddRectFilled(ImVec2(hmx - 3.0f, hb.Min.y - 3.0f), ImVec2(hmx + 3.0f, hb.Max.y + 3.0f),
+                      white, 2.0f);
+    dl->AddRectFilled(ImVec2(hmx - 1.5f, hb.Min.y - 1.5f), ImVec2(hmx + 1.5f, hb.Max.y + 1.5f),
+                      hue32, 1.0f);
+    ImGui::InvisibleButton("##hue", ImVec2(w, 14.0f));
+    if (ImGui::IsItemActive()) {
+        h = ImSaturate((io.MousePos.x - hb.Min.x) / ImMax(1.0f, hb.GetWidth()));
+        changed = true;
+    }
+
+    if (comps >= 4) {
+        ImGui::Dummy(ImVec2(0, 4));
+        ImVec2 ap = window->DC.CursorPos;
+        ImRect ab(ap, ImVec2(ap.x + w, ap.y + 8.0f));
+        const float cs = 4.0f;
+        const ImU32 c1 = IM_COL32(64, 64, 64, 255);
+        const ImU32 c2 = IM_COL32(38, 38, 38, 255);
+        int ky = 0;
+        for (float yy = ab.Min.y; yy < ab.Max.y; yy += cs, ++ky) {
+            int kx = 0;
+            for (float xx = ab.Min.x; xx < ab.Max.x; xx += cs, ++kx)
+                dl->AddRectFilled(ImVec2(xx, yy),
+                                  ImVec2(ImMin(xx + cs, ab.Max.x), ImMin(yy + cs, ab.Max.y)),
+                                  ((kx + ky) & 1) ? c2 : c1);
+        }
+        ImColor l0(col[0], col[1], col[2], 0.0f);
+        ImColor l1(col[0], col[1], col[2], alpha8);
+        dl->AddRectFilledMultiColor(ab.Min, ab.Max, l0, l1, l1, l0);
+        ImU32 am_col = ui_color_lerp(white, ImGui::GetColorU32(ImVec4(col[0], col[1], col[2], 1.0f)),
+                                     ImClamp(col[3], 0.0f, 1.0f));
+        float amx = ab.Min.x + 4.0f + (w - 8.0f) * ImClamp(col[3], 0.0f, 1.0f);
+        dl->AddRectFilled(ImVec2(amx - 3.0f, ab.Min.y - 3.0f), ImVec2(amx + 3.0f, ab.Max.y + 3.0f),
+                          white, 2.0f);
+        dl->AddRectFilled(ImVec2(amx - 1.5f, ab.Min.y - 1.5f), ImVec2(amx + 1.5f, ab.Max.y + 1.5f),
+                          am_col, 1.0f);
+        ImGui::InvisibleButton("##alpha", ImVec2(w, 14.0f));
+        if (ImGui::IsItemActive()) {
+            col[3] = ImSaturate((io.MousePos.x - ab.Min.x) / ImMax(1.0f, ab.GetWidth()));
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        ImGui::ColorConvertHSVtoRGB(h, s, v, col[0], col[1], col[2]);
+        ImGui::MarkItemEdited(window->GetID("##picker"));
+    }
+}
+
+static bool color_swatch(const char* str_id, const float* col, int comps, bool selected) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImVec2 pos = window->DC.CursorPos;
+    float hh = ImMax(20.0f, ImGui::GetTextLineHeight());
+    const ImGuiID sid = window->GetID(str_id);
+    bool pressed = ImGui::InvisibleButton(str_id, ImVec2(20.0f, hh));
+    bool hovered = ImGui::IsItemHovered();
+    float& anim = g_check_anim[sid];
+    anim += (((selected || hovered) ? 1.0f : 0.0f) - anim) * ImMin(1.0f, 14.0f * ImGui::GetIO().DeltaTime);
+    if (anim < 0.001f) anim = 0.0f;
+    if (anim > 0.999f) anim = 1.0f;
+    int a = (comps >= 4) ? (int)(ImClamp(col[3], 0.0f, 1.0f) * 255.0f) : 255;
+    ImU32 c = IM_COL32((int)(ImClamp(col[0], 0.0f, 1.0f) * 255.0f),
+                       (int)(ImClamp(col[1], 0.0f, 1.0f) * 255.0f),
+                       (int)(ImClamp(col[2], 0.0f, 1.0f) * 255.0f),
+                       (int)((float)a * style.Alpha));
+    ImVec2 cen(pos.x + 10.0f, pos.y + hh * 0.5f);
+    window->DrawList->AddCircleFilled(cen, 8.0f, c);
+    window->DrawList->AddCircle(cen, 9.5f,
+                                ui_col_a(IM_COL32(255, 255, 255, 255), anim), 0, 1.5f);
+    return pressed;
+}
+
 static bool accent_checkbox_color(const char* label, bool* v, float* col, int comps, const char* popup_id) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
     ImGui::PushID(label);
     ImGui::PushID(popup_id);
-    ImGuiContext& g = *GImGui;
-    const ImGuiStyle& style = g.Style;
-    const ImGuiID id = window->GetID(label);
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImGuiID id = window->GetID("##cbc");
     const ImVec2 label_size = ImGui::CalcTextSize(label, NULL, true);
-    const float swatch_size = 14.0f;
-    const float box_size    = 17.0f;
+    const float swatch_size = 20.0f;
+    const float box_size    = 36.0f;
+    const float box_h       = 18.0f;
     const float gap_sw      = 8.0f;
     const float gap_cb      = 8.0f;
-    const float height = ImMax(ImMax(swatch_size, box_size), label_size.y);
+    const float height = ImMax(ImMax(swatch_size, box_h), label_size.y);
     const float total_w = swatch_size + gap_sw + box_size +
                           (label_size.x > 0.0f ? gap_cb + label_size.x : 0.0f);
     ImVec2 pos = window->DC.CursorPos;
     ImRect total_bb(pos, ImVec2(pos.x + total_w, pos.y + height));
     ImGui::ItemSize(total_bb, style.FramePadding.y);
     if (!ImGui::ItemAdd(total_bb, id)) { ImGui::PopID(); ImGui::PopID(); return false; }
-    ImRect swatch_bb(ImVec2(pos.x, pos.y + (height - swatch_size) * 0.5f),
-                     ImVec2(pos.x + swatch_size, pos.y + (height + swatch_size) * 0.5f));
-    ImGui::SetCursorScreenPos(swatch_bb.Min);
-    ImGui::PushID(popup_id);
-    bool swatch_clicked = ImGui::InvisibleButton("##swatch", ImVec2(swatch_size, swatch_size));
-    if (swatch_clicked) ImGui::OpenPopup("##picker_popup");
-    ImGui::PopID();
-    int a = (comps >= 4) ? (int)(col[3] * 255) : 255;
-    ImU32 swatch_col = IM_COL32((int)(col[0] * 255), (int)(col[1] * 255),
-                                (int)(col[2] * 255), a);
-    window->DrawList->AddRectFilled(swatch_bb.Min, swatch_bb.Max, swatch_col, 3.0f);
-    ImGui::PushID(popup_id);
-    bool popup_open = ImGui::BeginPopup("##picker_popup");
-    if (popup_open) {
-        ImGui::PushID("##picker_inner");
-        if (comps >= 4) {
-            ImGui::ColorPicker4("##picker", col,
-                ImGuiColorEditFlags_PickerHueBar | ImGuiColorEditFlags_NoInputs |
-                ImGuiColorEditFlags_AlphaBar);
-        } else {
-            ImGui::ColorPicker3("##picker", col,
-                ImGuiColorEditFlags_PickerHueBar | ImGuiColorEditFlags_NoInputs |
-                ImGuiColorEditFlags_NoAlpha);
-        }
-        ImGui::PopID();
+
+    ImGui::SetCursorScreenPos(pos);
+    if (color_swatch("##swatch", col, comps, *v)) ImGui::OpenPopup("##picker_popup");
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16, 16));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 8));
+    if (ImGui::BeginPopup("##picker_popup")) {
+        ui_color_picker(col, comps, 228.0f);
         ImGui::EndPopup();
     }
-    ImGui::PopID();
-    ImVec2 cb_pos(swatch_bb.Max.x + gap_sw, pos.y + (height - box_size) * 0.5f);
-    ImRect cb_bb(cb_pos, ImVec2(cb_pos.x + box_size, cb_pos.y + box_size));
-    ImGui::SetCursorScreenPos(cb_bb.Min);
-    ImGui::PushID("##chk");
+    ImGui::PopStyleVar(2);
+
+    ImVec2 cb_pos(pos.x + swatch_size + gap_sw, pos.y + (height - box_h) * 0.5f);
+    ImRect cb_bb(cb_pos, ImVec2(cb_pos.x + box_size, cb_pos.y + box_h));
+    ImGui::SetCursorScreenPos(cb_pos);
     bool cb_clicked = ImGui::InvisibleButton("##chkbox", ImVec2(box_size, box_size));
     bool cb_hovered = ImGui::IsItemHovered();
-    ImGui::PopID();
+    bool cb_held    = ImGui::IsItemActive();
     if (cb_clicked) { *v = !*v; ImGui::MarkItemEdited(id); }
     float& anim = g_check_anim[id];
-    float target = *v ? 1.0f : 0.0f;
-    anim += (target - anim) * ImMin(1.0f, 14.0f * g.IO.DeltaTime);
+    anim += ((*v ? 1.0f : 0.0f) - anim) * ImMin(1.0f, 14.0f * ImGui::GetIO().DeltaTime);
     if (anim < 0.001f) anim = 0.0f;
     if (anim > 0.999f) anim = 1.0f;
-    ImDrawList* dl = window->DrawList;
-    draw_check_glow(dl, cb_bb, anim, cb_hovered);
-    if (anim > 0.01f)
-        dl->AddRectFilled(cb_bb.Min, cb_bb.Max, IM_COL32(136, 100, 255, (int)(anim * 255)), 4.0f);
-    dl->AddRect(cb_bb.Min, cb_bb.Max,
-        anim > 0.01f ? IM_COL32(136, 100, 255, 255) : IM_COL32(92, 92, 106, 255), 4.0f, 0, 1.2f);
-    draw_check_v(dl, cb_bb, anim);
+    draw_toggle(window->DrawList, cb_bb, anim, cb_hovered, cb_held);
     if (label_size.x > 0.0f)
-        ImGui::RenderText(ImVec2(cb_bb.Max.x + gap_cb,
-                                 pos.y + (height - label_size.y) * 0.5f), label);
+        ImGui::RenderText(ImVec2(cb_bb.Max.x + gap_cb, pos.y + (height - label_size.y) * 0.5f), label);
+    ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + height));
+    ImGui::Dummy(ImVec2(0, 0));
     ImGui::PopID();
     ImGui::PopID();
     return cb_clicked;
@@ -1570,7 +1819,7 @@ static bool smooth_slider(const char* label, float* v, float lo, float hi,
     float val_w = ImGui::CalcTextSize(valbuf).x;
     float track_w = avail - label_w - val_w - 30.0f;
     if (track_w < 40.0f) track_w = 40.0f;
-    float h = ImMax(1.0f, ImGui::GetFrameHeight() - 2.0f);
+    float h = ImMax(20.0f, ImGui::GetFrameHeight() - 10.0f);
     ImVec2 pos = window->DC.CursorPos;
     float tx = pos.x + label_w + 10.0f;
     ImGui::SetCursorScreenPos(ImVec2(tx, pos.y));
@@ -1584,26 +1833,26 @@ static bool smooth_slider(const char* label, float* v, float lo, float hi,
         float nv = lo + f * (hi - lo);
         if (fabsf(nv - *v) > 0.0001f) { *v = nv; changed = true; ImGui::MarkItemEdited(track_id); }
     }
-    float frac = ImClamp((*v - lo) / (hi - lo), 0.0f, 1.0f);
+    float frac = ImClamp((*v - lo) / ImMax(0.0001f, hi - lo), 0.0f, 1.0f);
     float& sm = g_slider_anim[id];
     sm += (frac - sm) * ImMin(1.0f, 13.0f * io.DeltaTime);
     ImDrawList* dl = window->DrawList;
     float cy = pos.y + h * 0.5f;
-    float bar_h = 5.0f;
+    float bar_h = 4.0f;
     dl->AddRectFilled(ImVec2(tx, cy - bar_h * 0.5f), ImVec2(tx + track_w, cy + bar_h * 0.5f),
-                      IM_COL32(42, 42, 52, 255), bar_h * 0.5f);
+                      hovered ? COL_FRAME_HOVER : COL_FRAME_BG, style.FrameRounding);
     dl->AddRectFilled(ImVec2(tx, cy - bar_h * 0.5f), ImVec2(tx + track_w * sm, cy + bar_h * 0.5f),
-                      COL_ACCENT, bar_h * 0.5f);
+                      COL_SCHEME, style.FrameRounding);
     float gx = tx + track_w * sm;
     float gr = (hovered || active) ? 6.5f : 5.0f;
-    dl->AddCircleFilled(ImVec2(gx, cy), gr, COL_ACCENT, 12);
-    dl->AddCircle(ImVec2(gx, cy), gr, IM_COL32(20, 20, 26, 255), 12, 1.0f);
+    dl->AddCircleFilled(ImVec2(gx, cy), gr, ImGui::GetColorU32(ImGuiCol_SliderGrab));
+    dl->AddCircle(ImVec2(gx, cy), gr, ui_col_a(COL_SCHEME, 0.9f), 0, 1.0f);
     float ty = pos.y + (h - ImGui::GetTextLineHeight()) * 0.5f;
     ImGui::RenderText(ImVec2(pos.x, ty), label);
     ImGui::RenderText(ImVec2(tx + track_w + 8.0f, ty), valbuf);
     float advance = h + 4.0f;
     if (lo_tag || hi_tag) {
-        ImU32 dim = IM_COL32(120, 120, 130, 255);
+        ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
         if (lo_tag) dl->AddText(ImVec2(tx, pos.y + h + 1.0f), dim, lo_tag);
         if (hi_tag) {
             float tw = ImGui::CalcTextSize(hi_tag).x;
@@ -1617,31 +1866,81 @@ static bool smooth_slider(const char* label, float* v, float lo, float hi,
     return changed;
 }
 
+static bool ui_combo(const char* label, int* cur, const char* items, int count, float width = 0.0f) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+    if (count < 1) count = 1;
+    if (*cur < 0) *cur = 0;
+    if (*cur >= count) *cur = count - 1;
+    ImGui::PushID(label);
+    const ImGuiID id = window->GetID("##combo");
+    const ImGuiStyle& style = ImGui::GetStyle();
+    float avail = (width > 0.0f) ? width : ImGui::GetContentRegionAvail().x;
+    float h = ImMax(20.0f, ImGui::GetFrameHeight() - 10.0f);
+    ImVec2 pos = window->DC.CursorPos;
+    ImRect bb(pos, ImVec2(pos.x + avail, pos.y + h));
+    ImGui::ItemSize(bb, style.FramePadding.y);
+    if (!ImGui::ItemAdd(bb, id)) { ImGui::PopID(); return false; }
+    bool hovered = false, held = false;
+    bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    if (pressed) ImGui::OpenPopup("##popup");
+    ImDrawList* dl = window->DrawList;
+    ImU32 bg = held ? COL_FRAME_ACTIVE : (hovered ? COL_FRAME_HOVER : COL_FRAME_BG);
+    dl->AddRectFilled(bb.Min, bb.Max, bg, style.FrameRounding);
+    float ty = bb.GetCenter().y - ImGui::GetTextLineHeight() * 0.5f;
+    dl->AddText(ImVec2(bb.Min.x + 10.0f, ty), ImGui::GetColorU32(ImGuiCol_Text), label);
+    const char* cur_item = ui_combo_item(items, *cur);
+    ImVec2 vs = ImGui::CalcTextSize(cur_item);
+    float ax = bb.Max.x - 12.0f;
+    dl->AddText(ImVec2(ax - 10.0f - vs.x, bb.GetCenter().y - vs.y * 0.5f),
+                ImGui::GetColorU32(ImGuiCol_TextDisabled), cur_item);
+    ImVec2 c(ax - 3.0f, bb.GetCenter().y - 1.0f);
+    dl->AddTriangleFilled(ImVec2(c.x - 3.5f, c.y - 2.0f), ImVec2(c.x + 3.5f, c.y - 2.0f),
+                          ImVec2(c.x, c.y + 3.0f), ImGui::GetColorU32(ImGuiCol_TextDisabled));
+    bool changed = false;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+    if (ImGui::BeginPopup("##popup")) {
+        for (int i = 0; i < count; ++i) {
+            const char* it = ui_combo_item(items, i);
+            if (ImGui::Selectable(it, i == *cur, ImGuiSelectableFlags_None,
+                                  ImVec2(ImMax(60.0f, avail - 16.0f), 22.0f))) {
+                *cur = i;
+                changed = true;
+                ImGui::MarkItemEdited(id);
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar(2);
+    ImGui::PopID();
+    return changed;
+}
+
 static bool ui_button(const char* label, float w, float h, bool primary) {
     w = ImMax(1.0f, w);
     h = ImMax(1.0f, h);
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return false;
     ImGui::PushID(label);
-
+    const ImGuiStyle& style = ImGui::GetStyle();
     const ImGuiID id = window->GetID("##b");
     ImVec2 pos = window->DC.CursorPos;
     ImRect bb(pos, ImVec2(pos.x + w, pos.y + h));
-    bool pressed = ImGui::InvisibleButton("##b", ImVec2(w, h));
-    bool hovered = ImGui::IsItemHovered();
+    ImGui::ItemSize(bb, style.FramePadding.y);
+    if (!ImGui::ItemAdd(bb, id)) { ImGui::PopID(); return false; }
+    bool hovered = false, held = false;
+    bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
     float& anim = g_btn_anim[id];
-    float target = hovered ? 1.0f : 0.0f;
-    anim += (target - anim) * ImMin(1.0f, 14.0f * ImGui::GetIO().DeltaTime);
+    anim += ((hovered ? 1.0f : 0.0f) - anim) * ImMin(1.0f, 14.0f * ImGui::GetIO().DeltaTime);
     ImDrawList* dl = window->DrawList;
-    ImU32 bg = primary ? IM_COL32(136, 100, 255, (int)(38.0f + anim * 40.0f))
-                       : IM_COL32(255, 255, 255, (int)(8.0f + anim * 16.0f));
-    ImU32 bd = primary ? IM_COL32(136, 100, 255, (int)(130.0f + anim * 125.0f))
-                       : IM_COL32(75, 75, 92, (int)(160.0f + anim * 80.0f));
-    dl->AddRectFilled(bb.Min, bb.Max, bg, 7.0f);
-    dl->AddRect(bb.Min, bb.Max, bd, 7.0f, 0, 1.0f);
+    ImU32 bg;
+    if (primary) bg = held ? COL_SCHEME_ACT : ui_color_lerp(COL_SCHEME, COL_SCHEME_HOVER, anim);
+    else         bg = held ? COL_FRAME_ACTIVE : ui_color_lerp(COL_FRAME_BG, COL_FRAME_HOVER, anim);
+    dl->AddRectFilled(bb.Min, bb.Max, bg, style.FrameRounding);
     ImVec2 ts = ImGui::CalcTextSize(label);
     dl->AddText(ImVec2(bb.Min.x + (w - ts.x) * 0.5f, bb.Min.y + (h - ts.y) * 0.5f),
-        primary ? COL_ACCENT_SOFT : COL_TEXT, label);
+                primary ? IM_COL32(255, 255, 255, 255) : ImGui::GetColorU32(ImGuiCol_Text), label);
     ImGui::PopID();
     return pressed;
 }
@@ -1651,6 +1950,7 @@ typedef void (*SubCardFn)(void*);
 
 static void draw_sub_card(const char* id, bool open, float full_h,
                           SubCardFn fn, void* ctx, float parent_x) {
+    (void)full_h;
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return;
     ImGui::PushID(id);
@@ -1660,54 +1960,32 @@ static void draw_sub_card(const char* id, bool open, float full_h,
     a += (target - a) * ImMin(1.0f, 11.0f * ImGui::GetIO().DeltaTime);
     if (target == 1.0f && a > 0.998f) a = 1.0f;
     if (target == 0.0f && a < 0.002f) a = 0.0f;
+    if (a < 0.02f) { ImGui::PopID(); return; }
+    float indent = ImMax(0.0f, parent_x);
     ImVec2 pos = window->DC.CursorPos;
-    float indent = parent_x + 18.0f;
-    float w = ImMax(40.0f, ImGui::GetContentRegionAvail().x - indent - 10.0f);
-    float h = full_h * a;
-    if (h < 2.0f) { ImGui::PopID(); return; }
-    ImVec2 r0(pos.x + indent, pos.y);
-    ImVec2 r1(r0.x + w, r0.y + h);
-    ImDrawList* dl = window->DrawList;
-    dl->AddRect(r0, r1, IM_COL32(118, 118, 132, (int)(150.0f * a)), 9.0f, 0, 1.0f);
-    ImU32 cc = IM_COL32(118, 118, 132, (int)(170.0f * a));
-    float cx = pos.x + parent_x;
-    float cy = r0.y + ImMin(h * 0.5f, 14.0f);
-    float top = pos.y - 2.0f;
-    float bend = ImMax(top + 1.0f, cy - 8.0f);
-    float ex = r0.x - 3.0f;
-    float rad = ImMin(8.0f, ImMax(2.0f, (ex - cx) * 0.5f));
-    dl->AddLine(ImVec2(cx, top), ImVec2(cx, bend), cc, 1.0f);
-    ImVec2 q0(cx, bend);
-    ImVec2 q1(cx, cy);
-    ImVec2 q2(cx + rad, cy);
-    ImVec2 prev = q0;
-    for (int k = 1; k <= 12; ++k) {
-        float u = (float)k / 12.0f;
-        float v = 1.0f - u;
-        ImVec2 pt(v * v * q0.x + 2.0f * v * u * q1.x + u * u * q2.x,
-                  v * v * q0.y + 2.0f * v * u * q1.y + u * u * q2.y);
-        dl->AddLine(prev, pt, cc, 1.0f);
-        prev = pt;
-    }
-    dl->AddLine(q2, ImVec2(ex, cy), cc, 1.0f);
-    dl->AddLine(ImVec2(ex - 3.5f, cy - 2.5f), ImVec2(ex, cy), cc, 1.0f);
-    dl->AddLine(ImVec2(ex - 3.5f, cy + 2.5f), ImVec2(ex, cy), cc, 1.0f);
-    ImGui::SetCursorScreenPos(ImVec2(r0.x + 10.0f, r0.y + 6.0f));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::BeginChild("##sub_body", ImVec2(ImMax(1.0f, w - 20.0f), ImMax(1.0f, h - 12.0f)), false,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    float bar_x = pos.x + indent;
+    float prev_h = g_sub_h[aid];
+    if (prev_h > 2.0f)
+        window->DrawList->AddRectFilled(ImVec2(bar_x - 12.0f, pos.y - 2.0f),
+                                        ImVec2(bar_x - 10.0f, pos.y - 2.0f + prev_h),
+                                        ui_col_a(COL_SCHEME, 0.85f * a), 1.0f);
+    ImGui::SetCursorScreenPos(ImVec2(bar_x, pos.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(14, 10));
+    ImGui::BeginGroup();
     if (fn) fn(ctx);
-    ImGui::EndChild();
+    ImGui::EndGroup();
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
-    ImGui::PopID();
-    ImGui::SetCursorScreenPos(ImVec2(pos.x, pos.y + h + 6.0f));
+    ImVec2 gmax = ImGui::GetItemRectMax();
+    g_sub_h[aid] = ImMax(0.0f, gmax.y - pos.y + 4.0f);
+    ImGui::SetCursorScreenPos(ImVec2(pos.x, gmax.y + 2.0f));
     ImGui::Dummy(ImVec2(0.0f, 0.0f));
+    ImGui::PopID();
 }
 
-struct SubFilledCtx { bool* filled; float* col; };
+struct SubFilledCtx { bool* filled; float* col; bool* corner; bool* rounded; };
 struct SubDynCtx    { bool* dyn; };
+
+static void ui_tooltip(const char* text);
 
 static void sub_filled_fn(void* p) {
     SubFilledCtx* c = (SubFilledCtx*)p;
@@ -1715,36 +1993,61 @@ static void sub_filled_fn(void* p) {
     if (accent_checkbox("Filled", c->filled) && *c->filled && !was) {
         c->col[0] = 0.0f; c->col[1] = 0.0f; c->col[2] = 0.0f; c->col[3] = 0.30f;
     }
+    accent_checkbox("Corner Box", c->corner);
+    if (ImGui::IsItemHovered())
+        ui_tooltip("Desenha a caixa somente nas quatro quinas.");
+    accent_checkbox("Rounded Box", c->rounded);
+    if (ImGui::IsItemHovered())
+        ui_tooltip("Arredonda as bordas da caixa.");
 }
 
 static void sub_dyn_fn(void* p) {
     accent_checkbox("Dynamic Health", ((SubDynCtx*)p)->dyn);
 }
 
-static void card_begin(const char* id, const char* title, float w) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.07f, 0.07f, 0.09f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.16f, 0.16f, 0.19f, 1.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 9.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, 10));
-    ImGui::BeginChild(id, ImVec2(ImMax(1.0f, w), 0), true, ImGuiWindowFlags_NoScrollbar);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(136/255.f, 100/255.f, 255/255.f, 1.0f));
-    ImGui::TextUnformatted(title);
-    ImGui::PopStyleColor();
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 6));
+static void card_begin(const char* id, const char* title, float w, const char* icon = nullptr) {
+    char oid[96] = {};
+    char iid[96] = {};
+    snprintf(oid, sizeof(oid), "%s_main", id);
+    snprintf(iid, sizeof(iid), "%s_body", id);
+    float cw = (w > 0.0f)
+        ? w
+        : ImMax(60.0f, ImGui::GetWindowWidth() * 0.5f - ImGui::GetStyle().ItemSpacing.x * 0.5f - 20.0f);
+    ImGui::BeginChild(oid, ImVec2(cw, 0), false);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 wp = ImGui::GetWindowPos();
+    ImVec2 ws = ImGui::GetWindowSize();
+    const float hdr = 44.0f;
+    float tx = wp.x + 24.0f;
+    if (icon && icon[0] && g_font_icons) {
+        const float fs = g_icon_font_size * 0.7f;
+        ImVec2 isz = g_font_icons->CalcTextSizeA(fs, FLT_MAX, 0.0f, icon);
+        dl->AddText(g_font_icons, fs, ImVec2(tx, wp.y + hdr * 0.5f - isz.y * 0.5f),
+                    COL_SCHEME, icon);
+        tx += isz.x + 10.0f;
+    }
+    ImVec2 ts = ImGui::CalcTextSize(title, nullptr, true);
+    dl->AddText(ImVec2(tx, wp.y + hdr * 0.5f - ts.y * 0.5f),
+                ImGui::GetColorU32(ImGuiCol_Text), title, ImGui::FindRenderedTextEnd(title));
+    dl->AddRectFilled(ImVec2(wp.x, wp.y + hdr - 1.0f), ImVec2(wp.x + ws.x, wp.y + hdr),
+                      ImGui::GetColorU32(ImGuiCol_Border));
+    ImGui::SetCursorPos(ImVec2(24.0f, hdr + 24.0f));
+    ImGui::BeginChild(iid, ImVec2(-24.0f, -24.0f), false, ImGuiWindowFlags_NoBackground);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(18, 14));
 }
 
 static void card_end() {
+    ImGui::PopStyleVar();
     ImGui::EndChild();
-    ImGui::PopStyleVar(3);
-    ImGui::PopStyleColor(2);
+    ImGui::EndChild();
 }
 
 static void draw_esp_card(const char* card_id, const char* title, float card_w,
                           bool* enable,
                           bool* box,   float col_box[4],   const char* pop_box,
                           bool* box_filled,
+                          bool* box_corner,
+                          bool* box_rounded,
                           bool* lines, float col_lines[3], const char* pop_lines,
                           bool* names, float col_names[3], const char* pop_names,
                           bool* health,float col_health[3],const char* pop_health,
@@ -1753,13 +2056,12 @@ static void draw_esp_card(const char* card_id, const char* title, float card_w,
                           bool* skel,  float col_skel[3],  const char* pop_skel,
                           bool* distance, float col_distance[3],
                           const char* pop_distance) {
-    card_begin(card_id, title, card_w);
+    card_begin(card_id, title, card_w, CARD_ICON_EYE);
     accent_checkbox("Enable", enable);
     if (*enable) {
-        ImGui::Dummy(ImVec2(0, 6));
         accent_checkbox_color("Show Box", box, col_box, 4, pop_box);
-        SubFilledCtx fc = { box_filled, col_box };
-        draw_sub_card("##sub_filled", *box, 34.0f, sub_filled_fn, &fc, 30.0f);
+        SubFilledCtx fc = { box_filled, col_box, box_corner, box_rounded };
+        draw_sub_card("##sub_filled", *box, 74.0f, sub_filled_fn, &fc, 30.0f);
         accent_checkbox_color("Show Lines",    lines, col_lines, 3, pop_lines);
         accent_checkbox_color("Show Names",    names, col_names, 3, pop_names);
         accent_checkbox_color("Show Distance", distance, col_distance, 3, pop_distance);
@@ -1774,12 +2076,14 @@ static void draw_esp_card(const char* card_id, const char* title, float card_w,
 
 static void draw_visuals_page() {
     float avail_w = ImGui::GetContentRegionAvail().x;
-    float gap     = 18.0f;
+    float gap     = 20.0f;
     float col_w   = ImMax(1.0f, (avail_w - gap) * 0.5f);
     draw_esp_card("##esp_local_card", "ESP LOCAL", col_w,
         &g_esp_local_enable,
         &g_esp_local_box,    g_col_local_box,    "##cp_l_box",
         &g_esp_local_box_filled,
+        &g_esp_local_box_corner,
+        &g_esp_local_box_rounded,
         &g_esp_local_lines,  g_col_local_lines,  "##cp_l_lines",
         &g_esp_local_names,  g_col_local_names,  "##cp_l_names",
         &g_esp_local_health, g_col_local_health, "##cp_l_health",
@@ -1792,6 +2096,8 @@ static void draw_visuals_page() {
         &g_esp_players_enable,
         &g_esp_players_box,    g_col_players_box,    "##cp_p_box",
         &g_esp_players_box_filled,
+        &g_esp_players_box_corner,
+        &g_esp_players_box_rounded,
         &g_esp_players_lines,  g_col_players_lines,  "##cp_p_lines",
         &g_esp_players_names,  g_col_players_names,  "##cp_p_names",
         &g_esp_players_health, g_col_players_health, "##cp_p_health",
@@ -1817,29 +2123,29 @@ static bool keybind_button(const char* id, float width, const char* text,
     if (window->SkipItems) return false;
     ImGui::PushID(id);
     const ImGuiID bid = window->GetID("##btn");
-    const float   h   = ImMax(1.0f, ImGui::GetFrameHeight());
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float   h   = ImMax(20.0f, ImGui::GetFrameHeight() - 10.0f);
     const ImVec2  pos = window->DC.CursorPos;
     const ImRect  bb(pos, ImVec2(pos.x + width, pos.y + h));
-    ImGui::ItemSize(bb, ImGui::GetStyle().FramePadding.y);
+    ImGui::ItemSize(bb, style.FramePadding.y);
     if (!ImGui::ItemAdd(bb, bid)) { ImGui::PopID(); return false; }
     bool hovered = false, held = false;
     bool pressed = ImGui::ButtonBehavior(bb, bid, &hovered, &held);
-    ImU32 bg = hovered ? IM_COL32(255, 255, 255, 16) : IM_COL32(255, 255, 255, 8);
-    if (active)    bg = IM_COL32(136, 100, 255, 45);
-    if (capturing) bg = IM_COL32(136, 100, 255, 70);
+    ImU32 bg = hovered ? COL_FRAME_HOVER : COL_FRAME_BG;
+    if (active)    bg = ui_col_a(COL_SCHEME, 0.30f);
+    if (capturing) bg = ui_col_a(COL_SCHEME, 0.55f);
     ImDrawList* dl = window->DrawList;
-    dl->AddRectFilled(bb.Min, bb.Max, bg, 6.0f);
-    dl->AddRect(bb.Min, bb.Max,
-        capturing ? COL_ACCENT : IM_COL32(70, 70, 85, 255), 6.0f, 0, 1.1f);
+    dl->AddRectFilled(bb.Min, bb.Max, bg, style.FrameRounding);
     const ImVec2 tsz = ImGui::CalcTextSize(text);
     const float  iw  = aimbot_icon_w();
     const float  gap = (iw > 0.0f) ? 6.0f : 0.0f;
     const float  total = iw + gap + tsz.x;
     float x0 = bb.Min.x + (width - total) * 0.5f;
-    if (x0 < bb.Min.x + 4.0f) x0 = bb.Min.x + 4.0f;
-    const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+    if (x0 < bb.Min.x + 6.0f) x0 = bb.Min.x + 6.0f;
+    const ImU32 col = (capturing || active) ? IM_COL32(255, 255, 255, 255)
+                                            : ImGui::GetColorU32(ImGuiCol_Text);
     if (g_font_icons) {
-        const float fs = g_icon_font_size * 0.8f;
+        const float fs = g_icon_font_size * 0.65f;
         ImVec2 isz = g_font_icons->CalcTextSizeA(fs, FLT_MAX, 0.0f, AIMBOT_ICON_KEYBOARD);
         dl->AddText(g_font_icons, fs,
             ImVec2(x0, bb.Min.y + (h - isz.y) * 0.5f), col, AIMBOT_ICON_KEYBOARD);
@@ -1850,15 +2156,25 @@ static bool keybind_button(const char* id, float width, const char* text,
     return pressed;
 }
 
-static bool aimbot_keybind_button(float width) {
+static bool keybind_row(const char* label, const char* id, const char* key_name,
+                        bool capturing, bool active) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+    float avail = ImGui::GetContentRegionAvail().x;
+    float label_w = ImGui::CalcTextSize(label).x;
+    float pill_w = ImMax(80.0f, ImMin(avail * 0.5f, avail - label_w - 20.0f));
+    float h = ImMax(20.0f, ImGui::GetFrameHeight() - 10.0f);
+    ImVec2 pos = window->DC.CursorPos;
+    window->DrawList->AddText(ImVec2(pos.x, pos.y + (h - ImGui::GetTextLineHeight()) * 0.5f),
+                              ImGui::GetColorU32(ImGuiCol_Text), label);
+    ImGui::SetCursorScreenPos(ImVec2(pos.x + avail - pill_w, pos.y));
+    return keybind_button(id, pill_w, capturing ? "Pressione..." : key_name, capturing, active);
+}
+
+static bool aimbot_keybind_button() {
     char label[64] = {};
-    if (g_aimbot_capturing)
-        snprintf(label, sizeof(label), "Pressione uma tecla...");
-    else
-        snprintf(label, sizeof(label), "%s%s", g_aimbot_key_name,
-                 g_aimbot_aim_on ? " (ON)" : "");
-    return keybind_button("##aimbot_keybind", width, label,
-                          g_aimbot_capturing, g_aimbot_aim_on);
+    snprintf(label, sizeof(label), "%s%s", g_aimbot_key_name, g_aimbot_aim_on ? " (ON)" : "");
+    return keybind_row("Keybind", "##aimbot_keybind", label, g_aimbot_capturing, g_aimbot_aim_on);
 }
 
 static void misc_bind_start(int which) {
@@ -1870,116 +2186,75 @@ static void misc_bind_start(int which) {
 }
 
 static void draw_bind_button(const char* label, const char* key_name, int which) {
-    float w = ImMax(1.0f, ImGui::GetContentRegionAvail().x);
     ImGui::PushID(which);
     ImGui::PushID(label);
     bool capturing = (g_bind_capture == which);
-    ImVec2 lp = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight() + 2.0f));
-    ImGui::GetWindowDrawList()->AddText(lp,
-        ImGui::GetColorU32(ImGuiCol_TextDisabled), label);
-    char text[64] = {};
-    snprintf(text, sizeof(text), "%s", capturing ? "Pressione uma tecla..." : key_name);
-    if (keybind_button("##bind", w, text, capturing, false)) misc_bind_start(which);
+    if (keybind_row(label, "##bind", key_name, capturing, false)) misc_bind_start(which);
     ImGui::PopID();
     ImGui::PopID();
 }
 
 static void sub_fly_fn(void*) {
     draw_bind_button("Bind Key", g_fly_key_name, 3);
-    smooth_slider("Velocity", &g_fly_speed, 1.0f, 60.0f, "%.1f");
+    smooth_slider("Velocity", &g_fly_speed, 0.5f, 20.0f, "%.1f", "0.5", "20");
     if (g_fly_mode != FLY_MODE_TOGGLE) g_fly_mode = FLY_MODE_HOLD;
-    ImGui::Combo("Modo##fly_mode", &g_fly_mode, "Hold\0Toggle\0\0");
+    ui_combo("Modo", &g_fly_mode, "Hold\0Toggle\0\0", 2);
 }
 
 static void draw_aimbot_card(float w) {
-    card_begin("##aimbot_card", "Aimbot", w);
+    card_begin("##aimbot_card", "AIMBOT", w, CARD_ICON_CROSSHAIR);
     accent_checkbox("Enable Aimbot", &g_aimbot_enable);
     if (g_aimbot_enable) {
-        ImGui::Dummy(ImVec2(0, 8));
-        accent_checkbox_color("Show Fov", &g_aimbot_show_fov,
-                              g_aimbot_fov_col, 3, "##cp_aimbot_fov");
-        ImGui::Dummy(ImVec2(0, 4));
+        accent_checkbox_color("Show Fov", &g_aimbot_show_fov, g_aimbot_fov_col, 3, "##cp_aimbot_fov");
         smooth_slider("Fov Size", &g_aimbot_fov_size, 1.0f, 900.0f, "%.0f");
-        smooth_slider("Smooth",   &g_aimbot_smooth,   0.0f, 100.0f, "%.1f");
-        ImGui::Dummy(ImVec2(0, 2));
+        smooth_slider("Smooth", &g_aimbot_smooth, 0.0f, 100.0f, "%.1f");
         accent_checkbox("Center Dot", &g_aimbot_center_dot);
         accent_checkbox("Show Target", &g_aimbot_show_target);
-        ImGui::Dummy(ImVec2(0, 4));
-        float row_w  = ImGui::GetContentRegionAvail().x;
-        float item_w = (row_w - 8.0f) * 0.5f;
-        if (item_w < 80.0f) item_w = 80.0f;
-        ImVec2 lp = ImGui::GetCursorScreenPos();
-        ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight() + 4.0f));
-        ImDrawList* d = ImGui::GetWindowDrawList();
-        ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-        d->AddText(lp, dim, "Target Bone");
-        d->AddText(ImVec2(lp.x + item_w + 8.0f, lp.y), dim, "Keybind");
-        ImGui::PushItemWidth(item_w);
         if (g_aimbot_bone < 0 || g_aimbot_bone > 6) g_aimbot_bone = 0;
-        ImGui::Combo("##aimbot_bone", &g_aimbot_bone, AIMBOT_BONE_ITEMS, 7);
-        ImGui::PopItemWidth();
-        ImGui::SameLine(0.0f, 8.0f);
-        if (aimbot_keybind_button(item_w)) {
-            g_aimbot_capturing    = true;
-            g_aimbot_capture_tick = 0;
-            g_aimbot_key_held     = false;
+        ui_combo("Target Bone", &g_aimbot_bone, AIMBOT_BONE_ITEMS, 7);
+        if (aimbot_keybind_button()) {
+            g_aimbot_capturing     = true;
+            g_aimbot_capture_tick  = 0;
+            g_aimbot_key_held      = false;
             ImGui::ClearActiveID();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Clique e aperte qualquer tecla ou botao do mouse.\nESC cancela. Padrao: Mouse4.");
+            ui_tooltip("Clique e aperte qualquer tecla ou botao do mouse.\nESC cancela. Padrao: Mouse4.");
     }
     card_end();
 }
 
-
-static bool silent_keybind_button(float width) {
+static bool silent_keybind_button() {
     char label[64] = {};
-    if (g_silent_capturing)
-        snprintf(label, sizeof(label), "Pressione uma tecla...");
-    else
-        snprintf(label, sizeof(label), "%s%s", g_silent_key_name,
-                 g_silent_aim_on ? " (ON)" : "");
-    return keybind_button("##silent_keybind", width, label,
-                          g_silent_capturing, g_silent_aim_on);
+    snprintf(label, sizeof(label), "%s%s", g_silent_key_name, g_silent_aim_on ? " (ON)" : "");
+    return keybind_row("Keybind", "##silent_keybind", label, g_silent_capturing, g_silent_aim_on);
 }
 
 static void draw_silent_card(float w) {
-    card_begin("##silent_card", "Silent Aim", w);
-    accent_checkbox("Enable Silent Aim", &g_silent_enable);
+    card_begin("##silent_card", "SILENT AIM", w, CARD_ICON_GHOST);
+    if (accent_checkbox("Enable Silent Aim", &g_silent_enable) && g_silent_enable) {
+        // AC4 risk confirmed. game_sa.dll patching is detected on server switch
+        // regardless of retire/reinstall. Only the send_packet path (see
+        // hk send_packet) is AC-safe. Installing here means accepting a ban.
+        silent_install_hook();
+        silent_install_mid_hooks();
+    }
     if (g_silent_enable) {
-        ImGui::Dummy(ImVec2(0, 8));
-        accent_checkbox_color("Show Fov", &g_silent_show_fov,
-                              g_silent_fov_col, 3, "##cp_silent_fov");
-        ImGui::Dummy(ImVec2(0, 4));
+        accent_checkbox_color("Show Fov", &g_silent_show_fov, g_silent_fov_col, 3, "##cp_silent_fov");
         smooth_slider("Fov Size", &g_silent_fov_size, 1.0f, 900.0f, "%.0f");
-        ImGui::Dummy(ImVec2(0, 2));
         accent_checkbox("Center Dot", &g_silent_center_dot);
         accent_checkbox("Show Target", &g_silent_show_target);
         accent_checkbox("Ignore Walls", &g_silent_ignore_walls);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Desligado: verifica parede, veiculo e objeto antes do packet.\nLigado: ignora obstrucoes.");
-        ImGui::Dummy(ImVec2(0, 4));
-        float row_w  = ImGui::GetContentRegionAvail().x;
-        float item_w = (row_w - 8.0f) * 0.5f;
-        if (item_w < 80.0f) item_w = 80.0f;
-        ImVec2 lp = ImGui::GetCursorScreenPos();
-        ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight() + 4.0f));
-        ImDrawList* d = ImGui::GetWindowDrawList();
-        ImU32 dim = ImGui::GetColorU32(ImGuiCol_TextDisabled);
-        d->AddText(lp, dim, "Target Bone");
-        d->AddText(ImVec2(lp.x + item_w + 8.0f, lp.y), dim, "Keybind");
-        ImGui::PushItemWidth(item_w);
+            ui_tooltip("Desligado: verifica parede, veiculo e objeto antes do packet.\nLigado: ignora obstrucoes.");
         if (g_silent_bone < 0 || g_silent_bone > 6) g_silent_bone = 0;
-        ImGui::Combo("##silent_bone", &g_silent_bone, AIMBOT_BONE_ITEMS, 7);
-        ImGui::PopItemWidth();
-        ImGui::SameLine(0.0f, 8.0f);
-        if (silent_keybind_button(item_w)) {
+        ui_combo("Target Bone", &g_silent_bone, AIMBOT_BONE_ITEMS, 7);
+        if (silent_keybind_button()) {
             g_silent_capturing = true;
             ImGui::ClearActiveID();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Clique e aperte qualquer tecla ou botao do mouse.\nESC cancela. Padrao: Mouse5.");
+            ui_tooltip("Clique e aperte qualquer tecla ou botao do mouse.\nESC cancela. Padrao: Mouse5.");
     }
     card_end();
 }
@@ -1988,31 +2263,192 @@ static void sub_rapid_fn(void*) {
     smooth_slider("Fire Rate", &g_rapid_fire_rate, 1.0f, 100.0f, "%.0f", "x1", "x100");
 }
 
+static inline bool is_valid_ptr(uint32_t p);
+static uint32_t resolve_troll_ped();
+static void troll_explode(uint32_t ped);
+static void troll_fire(uint32_t ped);
+static void troll_spectate(uint32_t ped);
+static void troll_spectate_stop();
+
+#if 0 /* moved below get_ped_nickname - deps not yet visible here */
+static uint32_t find_ped_by_name(const char* name) {
+    if (!name || !name[0]) return 0;
+    uint32_t local_ped = get_local_ped();
+    uint32_t found = 0;
+    __try {
+        uint32_t pool = *(uint32_t*)ADDR_PED_POOL;
+        if (is_valid_ptr(pool)) {
+            uint32_t objects = *(uint32_t*)(pool + POOL_OBJ_OFF);
+            uint32_t flags   = *(uint32_t*)(pool + POOL_FLAG_OFF);
+            uint32_t size    = *(uint32_t*)(pool + POOL_SIZE_OFF);
+            if (is_valid_ptr(objects) && is_valid_ptr(flags) && size > 0) {
+                if (size > 256) size = 256;
+                for (uint32_t i = 0; i < size; ++i) {
+                    uint8_t flag = *(uint8_t*)(flags + i);
+                    if (flag & 0x80) continue;
+                    uint32_t ped = objects + i * PED_STRIDE;
+                    if (!is_valid_ptr(ped) || ped == local_ped) continue;
+                    char nick[64] = {};
+                    if (get_ped_nickname((int)i, ped, false, nick, sizeof(nick)) &&
+                        mta_stricmp(nick, name) == 0) {
+                        found = ped;
+                        break;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return found;
+}
+
+static uint32_t resolve_troll_ped() {
+    if (is_valid_ptr(g_troll_submenu_ped)) {
+        char nick[64] = {};
+        if (get_ped_nickname(-1, g_troll_submenu_ped, false, nick, sizeof(nick)) &&
+            mta_stricmp(nick, g_troll_submenu_name) == 0)
+            return g_troll_submenu_ped;
+    }
+    g_troll_submenu_ped = find_ped_by_name(g_troll_submenu_name);
+    return g_troll_submenu_ped;
+}
+
+static void explode_at_pos(const Vec3& pos, int type, float radius) {
+    using fn_add_explosion = void(__cdecl*)(const Vec3*, int, float, bool, bool, float);
+    __try {
+        fn_add_explosion fn = (fn_add_explosion)(uintptr_t)ADDR_EXPLOSION_ADD;
+        fn(&pos, type, radius, true, true, 1.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void troll_explode(uint32_t ped) {
+    Vec3 pos;
+    if (!get_ped_world_pos(ped, pos)) {
+        notify_push("Troll", TROLL_ICON_GLYPH, false, "Alvo fora do mundo");
+        return;
+    }
+    pos.z += 0.4f;
+    explode_at_pos(pos, EXPLOSION_GRENADE, TROLL_EXPLODE_RADIUS);
+    mta_logf("troll", "explode ped=%08X pos=%.1f,%.1f,%.1f", (unsigned)ped,
+             (double)pos.x, (double)pos.y, (double)pos.z);
+    notify_push("Troll", TROLL_ICON_GLYPH, true, "Explosao disparada em %s", g_troll_submenu_name);
+}
+
+static void troll_fire(uint32_t ped) {
+    Vec3 pos;
+    if (!get_ped_world_pos(ped, pos)) {
+        notify_push("Troll", TROLL_ICON_GLYPH, false, "Alvo fora do mundo");
+        return;
+    }
+    pos.z += 0.4f;
+    explode_at_pos(pos, EXPLOSION_MOLOTOV, TROLL_FIRE_RADIUS);
+    mta_logf("troll", "fire ped=%08X pos=%.1f,%.1f,%.1f", (unsigned)ped,
+             (double)pos.x, (double)pos.y, (double)pos.z);
+    notify_push("Troll", TROLL_ICON_GLYPH, true, "Molotov em %s", g_troll_submenu_name);
+}
+
+static void troll_spectate(uint32_t ped) {
+    if (!is_valid_ptr(ped)) return;
+    __try {
+        *(uint32_t*)ADDR_CAMERA_TARGET_PED = ped;
+        g_spectate_ped    = ped;
+        g_spectate_active = true;
+        mta_logf("troll", "spectate attach ped=%08X", (unsigned)ped);
+        notify_push("Troll", TROLL_ICON_GLYPH, true, "Espectando %s", g_troll_submenu_name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void troll_spectate_stop() {
+    __try {
+        uint32_t me = get_local_ped();
+        *(uint32_t*)ADDR_CAMERA_TARGET_PED = is_valid_ptr(me) ? me : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_spectate_active = false;
+    g_spectate_ped    = 0;
+    mta_logf("troll", "spectate detach");
+}
+#endif /* moved below get_ped_nickname */
+
+static void draw_troll_submenu() {
+    float bw = ImGui::GetContentRegionAvail().x;
+    float bh = 32.0f;
+    float gap = 8.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(242 / 255.f, 32 / 255.f, 51 / 255.f, 1.0f));
+    ImGui::Text("%s", g_troll_submenu_name[0] ? g_troll_submenu_name : "Alvo");
+    ImGui::PopStyleColor();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    if (ui_button("< Return", bw, bh, false)) {
+        g_troll_submenu_open = false;
+        g_troll_submenu_name[0] = '\0';
+        g_troll_submenu_ped = 0;
+        return;
+    }
+    ImGui::Dummy(ImVec2(0, gap));
+
+    uint32_t ped = resolve_troll_ped();
+    bool can_act = is_valid_ptr(ped);
+
+    if (!can_act) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            ImVec4(255 / 255.f, 131 / 255.f, 17 / 255.f, 1.0f));
+        ImGui::TextWrapped("Alvo fora de alcance (nao streamado).");
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    const char* spec_label = g_spectate_active ? "Stop Spectate" : "Spectate";
+    if (ui_button(spec_label, bw, bh, g_spectate_active)) {
+        if (g_spectate_active) troll_spectate_stop();
+        else troll_spectate(ped);
+    }
+    ImGui::Dummy(ImVec2(0, gap));
+
+    if (ui_button("Explode", bw, bh, true)) troll_explode(ped);
+    ImGui::Dummy(ImVec2(0, gap));
+
+    if (ui_button("Fire", bw, bh, true)) troll_fire(ped);
+}
+
 static void draw_players_card(float w) {
-    card_begin("##troll_players_card", "Jogadores", w);
+    card_begin("##troll_players_card", "JOGADORES", w);
+    if (g_troll_submenu_open) {
+        draw_troll_submenu();
+        card_end();
+        return;
+    }
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0.0f);
-    float list_h = ImMax(1.0f, ImGui::GetContentRegionAvail().y * 0.5f);
-    ImGui::BeginChild("##troll_player_list", ImVec2(0, list_h), false);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4));
+    ImGui::BeginChild("##troll_player_list", ImVec2(0, 0), false,
+                      ImGuiWindowFlags_NoScrollbar);
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    float row_h = 26.0f;
     for (int i = 0; i < g_troll_count; ++i) {
         if (!g_troll_names[i][0]) continue;
         ImGui::PushID(i);
         ImVec2 p = ImGui::GetCursorScreenPos();
         float row_w = ImMax(1.0f, ImGui::GetContentRegionAvail().x);
-        bool clicked = ImGui::InvisibleButton("##row", ImVec2(row_w, 22.0f));
+        bool clicked = ImGui::InvisibleButton("##row", ImVec2(row_w, row_h));
         bool hovered = ImGui::IsItemHovered();
-        if (clicked)
+        if (clicked) {
             snprintf(g_troll_selected_name, sizeof(g_troll_selected_name), "%s", g_troll_names[i]);
+            snprintf(g_troll_submenu_name, sizeof(g_troll_submenu_name), "%s", g_troll_names[i]);
+            g_troll_submenu_ped = 0;
+            g_troll_submenu_open = true;
+        }
         bool sel = (strcmp(g_troll_selected_name, g_troll_names[i]) == 0);
-        if (sel || hovered)
-            dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + row_w, p.y + 22.0f),
-                sel ? IM_COL32(136, 100, 255, 30) : IM_COL32(255, 255, 255, 10), 5.0f);
-        dl->AddRect(ImVec2(p.x + 0.5f, p.y + 0.5f),
-                    ImVec2(p.x + row_w - 0.5f, p.y + 21.5f),
-                    IM_COL32(235, 235, 245, 165), 5.0f, 0, 1.0f);
-        dl->AddText(ImVec2(p.x + 8.0f, p.y + 4.0f),
-            sel ? COL_ACCENT : (hovered ? COL_TEXT : COL_TEXT_DIM), g_troll_names[i]);
+        if (sel)
+            dl->AddRectFilled(p, ImVec2(p.x + row_w, p.y + row_h), ui_col_a(COL_SCHEME, 0.18f), 3.0f);
+        else if (hovered)
+            dl->AddRectFilled(p, ImVec2(p.x + row_w, p.y + row_h), COL_FRAME_HOVER, 3.0f);
+        else
+            dl->AddRectFilled(p, ImVec2(p.x + row_w, p.y + row_h), COL_FRAME_BG, 3.0f);
+        if (sel)
+            dl->AddRectFilled(p, ImVec2(p.x + 2.0f, p.y + row_h), COL_SCHEME, 1.0f);
+        ImVec2 ts = ImGui::CalcTextSize(g_troll_names[i]);
+        dl->AddText(ImVec2(p.x + 10.0f, p.y + (row_h - ts.y) * 0.5f),
+                    sel ? IM_COL32(255, 255, 255, 255) : ImGui::GetColorU32(ImGuiCol_Text),
+                    g_troll_names[i]);
         ImGui::PopID();
     }
     ImGui::EndChild();
@@ -2022,9 +2458,19 @@ static void draw_players_card(float w) {
 }
 
 static void draw_troll_card(float w) {
-    card_begin("##troll_card", "Troll", w);
+    card_begin("##troll_card", "TROLL", w, CARD_ICON_BOLT);
     accent_checkbox("Rapid Fire", &g_rapid_fire_enable);
     draw_sub_card("##sub_rapid", g_rapid_fire_enable, 56.0f, sub_rapid_fn, nullptr, 8.0f);
+    if (accent_checkbox("Infinite Ammo", &g_infinite_ammo))
+        notify_push("Ammo", TROLL_ICON_GLYPH, true,
+                    g_infinite_ammo ? "Municao infinita ON" : "Municao infinita OFF");
+    if (ImGui::IsItemHovered())
+        ui_tooltip("Recarrega o clip e o total da arma atual do teu ped a cada frame.\nSomente no teu ped; valida slot (0-12) e tipo (0-46) antes de escrever.");
+    if (accent_checkbox("Fly Car", &g_fly_car))
+        notify_push("Fly Car", TROLL_ICON_GLYPH, true,
+                    g_fly_car ? "Fly Car ON: segure a tecla do Fly dentro do carro" : "Fly Car OFF");
+    if (ImGui::IsItemHovered())
+        ui_tooltip("Dentro de um veiculo, segure a tecla do Fly (padrao F8) e use\nW/S/A/D + Espaco/Ctrl. Escreve apenas move-speed do veiculo (max 32 m/s).");
     if (accent_checkbox("Fly", &g_fly_enable))
         notify_push("Fly", TROLL_ICON_GLYPH, true,
                     g_fly_enable ? "Fly Habilitado" : "Fly Desabilitado");
@@ -2033,26 +2479,26 @@ static void draw_troll_card(float w) {
 }
 
 static void draw_options_card(float w) {
-    card_begin("##options_card", "Options", w);
+    card_begin("##options_card", "OPTIONS", w, CARD_ICON_COG);
     accent_checkbox("Stream Proof", &g_stream_proof);
+    if (ImGui::IsItemHovered())
+        ui_tooltip("Esconde a janela do menu/overlay de capturas (OBS, Discord).\nSo aplica com o jogo em foco; limpa na hora se perder o foco.");
     card_end();
 }
 
 static void draw_config_card(float w) {
-    card_begin("##config_card", "Config", w);
+    card_begin("##config_card", "CONFIG", w, CARD_ICON_COG);
     draw_bind_button("Menu Key", g_menu_key_name, 2);
-    ImGui::Dummy(ImVec2(0, 8));
-    ImGui::Separator();
-    ImGui::Dummy(ImVec2(0, 6));
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x);
     if (ImGui::InputText("##cfg_name", g_cfg_input, sizeof(g_cfg_input),
                          ImGuiInputTextFlags_CharsNoBlank)) {
         g_cfg_pending_overwrite = false;
         g_cfg_pending_delete = false;
     }
-    ImGui::Dummy(ImVec2(0, 6));
-    float gap = 5.0f;
+    ImGui::PopItemWidth();
+    float gap = 6.0f;
     float bw = (ImGui::GetContentRegionAvail().x - gap * 3.0f) * 0.25f;
-    float bh = 24.0f;
+    float bh = 28.0f;
     if (ui_button("Save", bw, bh, true)) {
         g_cfg_pending_delete = false;
         cfg_save(g_cfg_input);
@@ -2080,20 +2526,19 @@ static void draw_config_card(float w) {
         cfg_scan(true);
         cfg_status(true, "%d config(s) encontrada(s).", g_cfg_count);
     }
-    ImGui::Dummy(ImVec2(0, 6));
     cfg_scan();
     const char* joined = "";
     cfg_name_combo(&joined, g_cfg_count);
     if (g_cfg_count > 0) {
         if (g_cfg_selected < 0 || g_cfg_selected >= g_cfg_count) g_cfg_selected = 0;
-        ImGui::Combo("##cfg_list", &g_cfg_selected, joined, g_cfg_count);
+        ui_combo("Configs", &g_cfg_selected, joined, g_cfg_count);
     }
     card_end();
 }
 
 static void draw_options_page() {
     float avail_w = ImGui::GetContentRegionAvail().x;
-    float gap     = 18.0f;
+    float gap     = 20.0f;
     float col_w   = ImMax(1.0f, (avail_w - gap) * 0.5f);
     draw_options_card(col_w);
     ImGui::SameLine(0.0f, gap);
@@ -2102,7 +2547,7 @@ static void draw_options_page() {
 
 static void draw_troll_page() {
     float avail_w = ImGui::GetContentRegionAvail().x;
-    float gap     = 18.0f;
+    float gap     = 20.0f;
     float col_w   = ImMax(1.0f, (avail_w - gap) * 0.5f);
     draw_troll_card(col_w);
     ImGui::SameLine(0.0f, gap);
@@ -2110,161 +2555,203 @@ static void draw_troll_page() {
 }
 
 static void draw_combat_page() {
-    float w = (ImGui::GetContentRegionAvail().x - 10.0f) * 0.5f;
+    float gap = 20.0f;
+    float w = ImMax(1.0f, (ImGui::GetContentRegionAvail().x - gap) * 0.5f);
     draw_aimbot_card(w);
-    ImGui::SameLine(0.0f, 10.0f);
+    ImGui::SameLine(0.0f, gap);
     draw_silent_card(w);
 }
 
-static bool draw_sidebar_tab(const char* icon, const char* id, bool selected,
-                             const char* fallback, bool* out_hovered) {
-    ImGuiWindow* window = ImGui::GetCurrentWindow();
-    if (window->SkipItems) { if (out_hovered) *out_hovered = false; return false; }
-    const ImGuiStyle& style = ImGui::GetStyle();
-    const ImGuiID iid = window->GetID(id);
-    const float size = 34.0f;
-    ImVec2 pos = window->DC.CursorPos;
-    ImRect bb(pos, ImVec2(pos.x + size, pos.y + size));
-    ImGui::ItemSize(bb, style.FramePadding.y);
-    if (!ImGui::ItemAdd(bb, iid)) {
-        if (out_hovered) *out_hovered = false;
-        ImGui::Dummy(ImVec2(0, 6));
-        return false;
-    }
-    bool hovered = false, held = false;
-    bool pressed = ImGui::ButtonBehavior(bb, iid, &hovered, &held);
-    if (out_hovered) *out_hovered = hovered;
-    ImDrawList* dl = window->DrawList;
-    if (selected) {
-        dl->AddRectFilled(bb.Min, bb.Max, COL_ACCENT_DIM, 8.0f);
-        dl->AddRectFilled(ImVec2(bb.Min.x, bb.Min.y + 7.0f),
-                          ImVec2(bb.Min.x + 3.0f, bb.Max.y - 7.0f), COL_ACCENT, 1.5f);
-    }
-    ImU32 col = selected ? COL_ACCENT : COL_TEXT_DIM;
-    if (g_font_icons && icon && icon[0]) {
-        ImVec2 sz = g_font_icons->CalcTextSizeA(g_icon_font_size, FLT_MAX, 0.0f, icon);
-        dl->AddText(g_font_icons, g_icon_font_size,
-            ImVec2(bb.Min.x + (size - sz.x) * 0.5f, bb.Min.y + (size - sz.y) * 0.5f),
-            col, icon);
+static const char* TAB_LABELS[TAB_COUNT] = {
+    "COMBAT", "VISUALS", "OPTIONS", "TROLL"
+};
+static const char* TAB_ICONS[TAB_COUNT] = {
+    CARD_ICON_CROSSHAIR, CARD_ICON_EYE, CARD_ICON_COG, CARD_ICON_BOLT
+};
+
+static void draw_tab_icon(ImDrawList* dl, int num, ImVec2 cen, float sz, ImU32 col) {
+    const float r = sz * 0.5f;
+    if (num == TAB_COMBAT) {
+        dl->AddCircle(cen, r * 0.62f, col, 0, 1.6f);
+        dl->AddLine(ImVec2(cen.x, cen.y - r), ImVec2(cen.x, cen.y - r * 0.34f), col, 1.6f);
+        dl->AddLine(ImVec2(cen.x, cen.y + r * 0.34f), ImVec2(cen.x, cen.y + r), col, 1.6f);
+        dl->AddLine(ImVec2(cen.x - r, cen.y), ImVec2(cen.x - r * 0.34f, cen.y), col, 1.6f);
+        dl->AddLine(ImVec2(cen.x + r * 0.34f, cen.y), ImVec2(cen.x + r, cen.y), col, 1.6f);
+        dl->AddCircleFilled(cen, 1.6f, col);
+    } else if (num == TAB_VISUALS) {
+        dl->PathClear();
+        dl->PathLineTo(ImVec2(cen.x - r, cen.y));
+        dl->PathBezierQuadraticCurveTo(ImVec2(cen.x, cen.y - r * 1.15f), ImVec2(cen.x + r, cen.y));
+        dl->PathBezierQuadraticCurveTo(ImVec2(cen.x, cen.y + r * 1.15f), ImVec2(cen.x - r, cen.y));
+        dl->PathStroke(col, 0, 1.6f);
+        dl->AddCircleFilled(cen, r * 0.34f, col);
+    } else if (num == TAB_MISC) {
+        dl->AddCircle(cen, r * 0.52f, col, 0, 1.6f);
+        for (int i = 0; i < 6; ++i) {
+            float a = (float)i * 3.14159265f / 3.0f;
+            ImVec2 d(cosf(a), sinf(a));
+            ImVec2 pp(-sinf(a), cosf(a));
+            ImVec2 c2(cen.x + d.x * r * 0.78f, cen.y + d.y * r * 0.78f);
+            dl->PathClear();
+            dl->PathLineTo(ImVec2(c2.x + pp.x * r * 0.30f - d.x * r * 0.28f,
+                                  c2.y + pp.y * r * 0.30f - d.y * r * 0.28f));
+            dl->PathLineTo(ImVec2(c2.x + pp.x * r * 0.30f + d.x * r * 0.28f,
+                                  c2.y + pp.y * r * 0.30f + d.y * r * 0.28f));
+            dl->PathLineTo(ImVec2(c2.x - pp.x * r * 0.30f + d.x * r * 0.28f,
+                                  c2.y - pp.y * r * 0.30f + d.y * r * 0.28f));
+            dl->PathLineTo(ImVec2(c2.x - pp.x * r * 0.30f - d.x * r * 0.28f,
+                                  c2.y - pp.y * r * 0.30f - d.y * r * 0.28f));
+            dl->PathFillConvex(col);
+        }
+        dl->AddCircleFilled(cen, r * 0.20f, col);
     } else {
-        ImVec2 sz = ImGui::CalcTextSize(fallback);
-        dl->AddText(ImVec2(bb.Min.x + (size - sz.x) * 0.5f,
-                           bb.Min.y + (size - sz.y) * 0.5f), col, fallback);
+        dl->PathClear();
+        dl->PathLineTo(ImVec2(cen.x + r * 0.28f, cen.y - r));
+        dl->PathLineTo(ImVec2(cen.x - r * 0.62f, cen.y + r * 0.12f));
+        dl->PathLineTo(ImVec2(cen.x - r * 0.06f, cen.y + r * 0.12f));
+        dl->PathLineTo(ImVec2(cen.x - r * 0.28f, cen.y + r));
+        dl->PathLineTo(ImVec2(cen.x + r * 0.62f, cen.y - r * 0.12f));
+        dl->PathLineTo(ImVec2(cen.x + r * 0.06f, cen.y - r * 0.12f));
+        dl->PathFillConvex(col);
     }
-    ImGui::Dummy(ImVec2(0, 6));
+}
+
+static bool tab_widget(int num) {
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    if (window->SkipItems) return false;
+    const char* label = TAB_LABELS[num];
+    ImGuiID id = window->GetID(label);
+    bool selected = (num == g_next_tab);
+    float selected_anim = ui_anim(label, 0, selected, 0.0f, 1.0f, UI_ANIM_SPEED);
+    const char* icon = TAB_ICONS[num];
+    const float tfs = 14.0f;
+    ImVec2 lsz = g_font_tabs
+        ? g_font_tabs->CalcTextSizeA(tfs, FLT_MAX, 0.0f, label)
+        : ImGui::CalcTextSize(label, nullptr, true);
+    const float iszf = g_font_icons ? g_icon_font_size * 0.7f : 14.0f;
+    ImVec2 isz = g_font_icons
+        ? g_font_icons->CalcTextSizeA(iszf, FLT_MAX, 0.0f, icon)
+        : ImVec2(14.0f, 14.0f);
+
+    ImVec2 size(46.0f + isz.x + (int)((lsz.x + 12.0f) * selected_anim), window->Size.y);
+    ImVec2 p = window->DC.CursorPos;
+    ImRect bb(p, ImVec2(p.x + size.x, p.y + size.y));
+    ImGui::ItemSize(bb);
+    ImGui::ItemAdd(bb, id);
+
+    bool hovered = false, held = false;
+    bool pressed = ImGui::ButtonBehavior(bb, id, &hovered, &held);
+    if (pressed && !selected) {
+        g_content_anim_dest = 0.0f;
+        g_next_tab = num;
+    }
+
+    float hover_anim = ui_anim(label, 1, hovered && !selected, 0.0f, 1.0f, UI_ANIM_SPEED);
+    ImDrawList* dl = window->DrawList;
+    ImRect pill(ImVec2(bb.Min.x + 4.0f, bb.Min.y + 11.0f),
+                ImVec2(bb.Max.x - 4.0f, bb.Max.y - 11.0f));
+    if (hover_anim > 0.001f)
+        dl->AddRectFilled(pill.Min, pill.Max, ui_col_a(COL_FRAME_HOVER, hover_anim * 0.6f), 4.0f);
+    if (selected_anim > 0.001f)
+        dl->AddRectFilled(pill.Min, pill.Max, ui_col_a(COL_SCHEME, selected_anim), 4.0f);
+    ImU32 icon_col = ui_color_lerp(ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                   IM_COL32(255, 255, 255, 255),
+                                   ImMax(selected_anim, hover_anim * 0.6f));
+    if (g_font_icons)
+        dl->AddText(g_font_icons, iszf,
+                    ImVec2(bb.Min.x + 23.0f, bb.GetCenter().y - isz.y * 0.5f), icon_col, icon);
+    else
+        draw_tab_icon(dl, num, ImVec2(bb.Min.x + 23.0f, bb.GetCenter().y), 14.0f, icon_col);
+    ImU32 text_col = ui_col_a(IM_COL32(255, 255, 255, 255), selected_anim);
+    ImVec2 lpos(bb.Max.x - lsz.x - 16.0f, bb.GetCenter().y - lsz.y * 0.5f);
+    if (g_font_tabs)
+        dl->AddText(g_font_tabs, tfs, lpos, text_col, label, ImGui::FindRenderedTextEnd(label));
+    else
+        dl->AddText(lpos, text_col, label, ImGui::FindRenderedTextEnd(label));
     return pressed;
 }
 
-static void draw_tab_badge(ImDrawList* dl, const ImVec2& anchor,
-                           const char* label, float a) {
-    if (a < 0.01f) return;
-    ImVec2 ts = ImGui::CalcTextSize(label);
-    float w = ts.x + 26.0f;
-    float h = 28.0f;
-    float x1 = anchor.x;
-    float x0 = x1 - w;
-    if (x0 < 8.0f) { x0 = 8.0f; x1 = x0 + w; }
-    ImVec2 p0(x0, anchor.y - h * 0.5f + (1.0f - a) * 6.0f);
-    ImVec2 p1(x1, p0.y + h);
-    dl->AddRectFilled(p0, p1, IM_COL32(18, 18, 24, (int)(245.0f * a)), 14.0f);
-    dl->AddRect(p0, p1, IM_COL32(136, 100, 255, (int)(255.0f * a)), 14.0f, 0, 1.2f);
-    dl->AddText(ImVec2(p0.x + 13.0f, p0.y + (h - ts.y) * 0.5f),
-        IM_COL32(160, 130, 255, (int)(255.0f * a)), label);
+static void render_page() {
+    switch (g_current_tab) {
+    case TAB_COMBAT:   draw_combat_page();   break;
+    case TAB_VISUALS:  draw_visuals_page();  break;
+    case TAB_MISC:     draw_options_page();  break;
+    case TAB_TROLL:    draw_troll_page();    break;
+    default:                                 break;
+    }
+}
+
+static void handle_alpha_anim() {
+    g_content_anim = ImLerp(g_content_anim, g_content_anim_dest, UI_ANIM_SPEED * 2.5f);
+    if (g_content_anim < 0.001f) {
+        g_content_anim_dest = 1.0f;
+        g_current_tab = g_next_tab;
+    }
 }
 
 static void draw_menu() {
-    const float WIN_W = 640.0f;
-    const float WIN_H = 420.0f;
-    const float HEADER_H = 48.0f;
-    const float SIDEBAR_X = 14.0f;
-    const float SIDEBAR_TOP = 62.0f;
-    const float CONTENT_X = 76.0f;
-    const float CONTENT_TOP = 62.0f;
-
     ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(WIN_W, WIN_H), ImGuiCond_Always);
-    ImGui::SetNextWindowPos(
-        ImVec2((io.DisplaySize.x - WIN_W) * 0.5f, (io.DisplaySize.y - WIN_H) * 0.5f),
-        ImGuiCond_FirstUseEver);
+    const ImVec2 win_size(650.0f, 440.0f);
+    g_menu_size = win_size;
+    ImGui::SetNextWindowSize(win_size, ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2((io.DisplaySize.x - win_size.x) * 0.5f,
+                                   (io.DisplaySize.y - win_size.y) * 0.5f),
+                            ImGuiCond_FirstUseEver);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
     ImGui::Begin("##main_menu", &g_menu_open,
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoBackground);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p0 = ImGui::GetWindowPos();
-    ImVec2 p1(p0.x + WIN_W, p0.y + WIN_H);
-    ImVec2 hdr1(p1.x, p0.y + HEADER_H);
-    dl->AddRectFilled(p0, p1, COL_BG_PANEL, 12.0f);
-    dl->AddRect(p0, p1, COL_BORDER, 12.0f, 0, 1.0f);
-    dl->AddRectFilled(p0, hdr1, COL_BG_HEADER, 12.0f, ImDrawFlags_RoundCornersTop);
-    dl->AddLine(ImVec2(p0.x, hdr1.y), hdr1, COL_ACCENT_DIM, 1.5f);
-    if (g_font_header) ImGui::PushFont(g_font_header);
-    dl->AddText(ImVec2(p0.x + 20.0f, p0.y + 11.0f), COL_ACCENT, "Hijacking");
-    float off = ImGui::CalcTextSize("Hijacking").x;
-    dl->AddText(ImVec2(p0.x + 20.0f + off + 6.0f, p0.y + 11.0f), COL_TEXT, "Menu");
-    if (g_font_header) ImGui::PopFont();
-    dl->AddRectFilled(ImVec2(p0.x + 6.0f, p0.y + HEADER_H + 6.0f),
-                      ImVec2(p0.x + 58.0f, p1.y - 6.0f), COL_BG_SIDEBAR, 8.0f);
-    static const char* tab_icons[TAB_COUNT] = {
-        ICON_FA_CROSSHAIRS, ICON_FA_EYE, ICON_FA_COG, TROLL_ICON_GLYPH
-    };
-    static const char* tab_ids[TAB_COUNT] = {
-        "##tab_combat", "##tab_visuals", "##tab_options", "##tab_troll"
-    };
-    static const char* tab_labels[TAB_COUNT] = {
-        "Combat", "Visuals", "Options", "Troll"
-    };
-    static const char* tab_fallback[TAB_COUNT] = { "C", "V", "O", "T" };
-    int hover_idx = -1;
-    float tab_y = p0.y + SIDEBAR_TOP;
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings);
+    g_menu_pos = ImGui::GetWindowPos();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, ImGui::GetStyle().WindowRounding);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    ImGui::BeginChild("##header", ImVec2(-1, 60), false, ImGuiWindowFlags_NoBackground);
+    ImGui::SetCursorPos(ImVec2(6.0f, 0.0f));
     for (int i = 0; i < TAB_COUNT; ++i) {
-        ImGui::SetCursorScreenPos(ImVec2(p0.x + SIDEBAR_X, tab_y));
-        bool hov = false;
-        if (draw_sidebar_tab(tab_icons[i], tab_ids[i], g_current_tab == i,
-                             tab_fallback[i], &hov)) {
-            if (g_current_tab != i) {
-                g_tab_dir = (i > g_current_tab) ? 1.0f : -1.0f;
-                g_current_tab = i;
-            }
-        }
-        if (hov) hover_idx = i;
-        tab_y += 40.0f;
+        tab_widget(i);
+        ImGui::SameLine(0, 0);
     }
-    float hover_target = (hover_idx >= 0) ? 1.0f : 0.0f;
-    g_hover_anim += (hover_target - g_hover_anim) * ImMin(1.0f, 12.0f * io.DeltaTime);
-    g_tab_alpha = ImClamp(
-        g_tab_alpha + (6.0f * io.DeltaTime * (g_current_tab == g_anim_tab ? 1.0f : -1.0f)),
-        0.0f, 1.0f);
-    if (g_tab_alpha == 0.0f) g_anim_tab = g_current_tab;
-    bool leaving = (g_current_tab != g_anim_tab);
-    float phase = leaving ? (1.0f - g_tab_alpha) : g_tab_alpha;
-    float ease = phase * phase * (3.0f - 2.0f * phase);
-    g_tab_slide = leaving ? (-g_tab_dir * 22.0f * ease)
-                          : (g_tab_dir * 22.0f * (1.0f - ease));
-    ImGui::SetCursorScreenPos(ImVec2(p0.x + CONTENT_X + g_tab_slide, p0.y + CONTENT_TOP));
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, g_tab_alpha * ImGui::GetStyle().Alpha);
-    ImGui::BeginChild("##content", ImVec2(WIN_W - CONTENT_X - 14.0f, WIN_H - CONTENT_TOP - 14.0f), false);
-    switch (g_anim_tab) {
-    case TAB_COMBAT:   draw_combat_page();  break;
-    case TAB_VISUALS:  draw_visuals_page(); break;
-    case TAB_MISC:     draw_options_page(); break;
-    case TAB_TROLL:    draw_troll_page();   break;
+    {
+        ImDrawList* hdl = ImGui::GetWindowDrawList();
+        ImVec2 hp = ImGui::GetWindowPos();
+        ImVec2 hs = ImGui::GetWindowSize();
+        const char* t1 = "Hijacking";
+        const char* t2 = "Menu";
+        const float fs = 20.0f;
+        ImVec2 s1 = g_font_header ? g_font_header->CalcTextSizeA(fs, FLT_MAX, 0.0f, t1)
+                                  : ImGui::CalcTextSize(t1);
+        ImVec2 s2 = g_font_header ? g_font_header->CalcTextSizeA(fs, FLT_MAX, 0.0f, t2)
+                                  : ImGui::CalcTextSize(t2);
+        const float gap = 6.0f;
+        const float pad = 22.0f;
+        float total = s1.x + gap + s2.x;
+        float x0 = hp.x + hs.x - pad - total;
+        float cy = hp.y + hs.y * 0.5f;
+        ImU32 c_red = IM_COL32(242, 32, 51, 255);
+        ImU32 c_wht = IM_COL32(255, 255, 255, 255);
+        if (g_font_header) {
+            hdl->AddText(g_font_header, fs, ImVec2(x0, cy - s1.y * 0.5f), c_red, t1);
+            hdl->AddText(g_font_header, fs, ImVec2(x0 + s1.x + gap, cy - s2.y * 0.5f), c_wht, t2);
+        } else {
+            hdl->AddText(ImVec2(x0, cy - s1.y * 0.5f), c_red, t1);
+            hdl->AddText(ImVec2(x0 + s1.x + gap, cy - s2.y * 0.5f), c_wht, t2);
+        }
     }
     ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, g_content_anim);
+    ImGui::SetCursorPos(ImVec2(20.0f, 60.0f));
+    ImGui::BeginChild("##content", ImVec2(-20.0f, -25.0f), false, ImGuiWindowFlags_NoBackground);
+    render_page();
+    ImGui::EndChild();
     ImGui::PopStyleVar();
-    if (hover_idx >= 0 && g_hover_anim > 0.01f) {
-        float hy = p0.y + SIDEBAR_TOP + (float)hover_idx * 40.0f + 17.0f;
-        dl->PushClipRect(ImVec2(0.0f, 0.0f), io.DisplaySize, false);
-        draw_tab_badge(dl, ImVec2(p0.x - 8.0f, hy), tab_labels[hover_idx], g_hover_anim);
-        dl->PopClipRect();
-    }
+
     ImGui::End();
-    ImGui::PopStyleColor();
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar();
+    handle_alpha_anim();
 }
 
 using fn_EndScene     = HRESULT(__stdcall*)(IDirect3DDevice9*);
@@ -2295,32 +2782,26 @@ static void stream_proof_apply() {
     }
     g_stream_proof_ready = true;
 
-    // WDA_EXCLUDEFROMCAPTURE so funciona no Win10 2004+ com DWM composition
-    // (windowed/borderless). Em exclusive fullscreen o DWM e desligado e a
-    // chamada falha; WDA_MONITOR e o fallback (janela preta em captura).
     DWORD desired = g_stream_proof ? WDA_EXCLUDEFROMCAPTURE_V : WDA_NONE_VALUE;
 
     if (g_stream_proof_applied == desired && g_stream_proof_hwnd == g_game_hwnd)
         return;
 
-    // Toggle OFF: sempre aplica imediatamente
-    if (!g_stream_proof) {
+    if (desired == WDA_NONE_VALUE) {
         if (set_display_affinity(g_game_hwnd, WDA_NONE_VALUE)) {
             g_stream_proof_applied = WDA_NONE_VALUE;
             g_stream_proof_hwnd    = g_game_hwnd;
             g_stream_proof_ok      = true;
-            mta_logf("wda", "stream proof OFF (WDA_NONE)");
+            mta_logf("wda", "stream proof OFF (WDA_NONE): render d3d9 intacto");
         }
         return;
     }
 
-    // Toggle ON: throttle retry em 2s (evita spam quando exclusive FS falha)
     uint32_t now = GetTickCount();
     if (g_stream_proof_last_try && (now - g_stream_proof_last_try) < 2000)
         return;
     g_stream_proof_last_try = now ? now : 1;
 
-    // 1) WDA_EXCLUDEFROMCAPTURE (janela ausente da captura)
     if (set_display_affinity(g_game_hwnd, WDA_EXCLUDEFROMCAPTURE_V)) {
         if (g_stream_proof_applied != WDA_EXCLUDEFROMCAPTURE_V)
             mta_logf("wda", "stream proof ON: WDA_EXCLUDEFROMCAPTURE (0x%X) aplicado",
@@ -2331,18 +2812,13 @@ static void stream_proof_apply() {
         return;
     }
 
-    // 2) WDA_MONITOR (janela preta em captura; funciona sem DWM / Win7+)
-    if (set_display_affinity(g_game_hwnd, WDA_MONITOR_VALUE)) {
-        if (g_stream_proof_applied != WDA_MONITOR_VALUE)
-            mta_logf("wda", "stream proof ON: WDA_MONITOR (0x%X) fallback (DWM off ou Win<2004)",
-                     (unsigned)WDA_MONITOR_VALUE);
-        g_stream_proof_applied = WDA_MONITOR_VALUE;
-        g_stream_proof_hwnd    = g_game_hwnd;
-        g_stream_proof_ok      = true;
-        return;
+    static bool wda_unsup_logged = false;
+    if (!wda_unsup_logged) {
+        wda_unsup_logged = true;
+        g_stream_proof_ok = false;
+        mta_logf("wda", "stream proof INDISPONIVEL: WDA_EXCLUDEFROMCAPTURE falhou (Win<1903 ou DWM off); WDA_MONITOR nao sera usado (apaga a tela do proprio usuario)");
     }
 
-    // 3) Falhou tudo (exclusive fullscreen ou SetWindowDisplayAffinity bloqueado)
     if (g_stream_proof_ok || mta_log_tick(7, 5000))
         mta_logf("wda!", "stream proof falhou: EXCLUDEFROMCAPTURE e MONITOR rejeitados "
                          "(exclusive fullscreen? use borderless)");
@@ -2354,7 +2830,7 @@ static void stream_proof_apply() {
 #ifndef SC_CLOSE_V
 #define SC_CLOSE_V 0xF060
 #endif
-static PatchRecord g_quit_patches[64] = {};
+static PatchRecord g_quit_patches[96] = {};
 static int         g_quit_patch_count = 0;
 
 static void quit_hard_restore() {
@@ -2363,7 +2839,7 @@ static void quit_hard_restore() {
     g_session_live_tick = 0;
     InterlockedExchange(&g_silent_send_ok, 0);
     int n = g_patch_count;
-    if (n > 64) n = 64;
+    if (n > 96) n = 96;
     if (n < 0) n = 0;
     for (int i = 0; i < n; ++i) g_quit_patches[i] = g_patches[i];
     g_quit_patch_count = n;
@@ -2380,6 +2856,24 @@ static void quit_hard_restore() {
                 }
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
+    }
+    // Ultimo passo: restaura hooks netc que quit_flush tirou de g_patches
+    // e guardou em g_quit_flush. Roda DEPOIS de qualquer hook game_sa
+    // (silent_retire_hooks em quit_flush) — netc e o ultimo a sair.
+    if (g_quit_flush_count > 0) {
+        for (int i = 0; i < g_quit_flush_count; ++i) {
+            PatchRecord& pr = g_quit_flush[i];
+            if (!pr.addr) continue;
+            __try {
+                DWORD oldp = 0;
+                if (VirtualProtect(pr.addr, 5, PAGE_EXECUTE_READWRITE, &oldp)) {
+                    memcpy(pr.addr, pr.original, 5);
+                    VirtualProtect(pr.addr, 5, oldp, &oldp);
+                    FlushInstructionCache(GetCurrentProcess(), pr.addr, 5);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        mta_logf("quit", "netc restaurado por ultimo: %d hooks", g_quit_flush_count);
     }
 }
 
@@ -2401,10 +2895,12 @@ static void emergency_disable_all() {
     }
 
     g_esp_local_enable = g_esp_local_box = g_esp_local_box_filled = false;
+    g_esp_local_box_corner = g_esp_local_box_rounded = false;
     g_esp_local_lines = g_esp_local_names = g_esp_local_health = false;
     g_esp_local_health_dynamic = g_esp_local_armor = g_esp_local_skeleton = false;
     g_esp_local_distance = false;
     g_esp_players_enable = g_esp_players_box = g_esp_players_box_filled = false;
+    g_esp_players_box_corner = g_esp_players_box_rounded = false;
     g_esp_players_lines = g_esp_players_names = g_esp_players_health = false;
     g_esp_players_health_dynamic = g_esp_players_armor = g_esp_players_skeleton = false;
     g_esp_players_distance = false;
@@ -2428,6 +2924,10 @@ static void emergency_disable_all() {
     g_stream_proof = false;
     g_menu_open = false; g_prev_insert = false; g_prev_menu_open = false;
     g_cfg_pending_overwrite = false; g_cfg_pending_delete = false;
+    g_troll_submenu_open = false;
+    g_troll_submenu_name[0] = '\0';
+    g_troll_submenu_ped = 0;
+    troll_spectate_stop();
 
     if (g_game_hwnd) set_display_affinity(g_game_hwnd, WDA_NONE_VALUE);
     g_stream_proof_ready   = false;
@@ -2500,12 +3000,15 @@ static LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     if (msg == WM_CLOSE || msg == WM_DESTROY || msg == WM_NCDESTROY ||
         msg == WM_QUIT || msg == WM_ENDSESSION || msg == WM_QUERYENDSESSION ||
         (msg == WM_SYSCOMMAND && (wParam & 0xFFF0) == SC_CLOSE_V)) {
+        // Ordem de saida: game_sa primeiro (silent/trajetoria em quit_flush),
+        // depois emergency que chama quit_hard_restore (netc POR ULTIMO).
         quit_flush();
         emergency_disable_all();
         static bool quit_msg_logged = false;
         if (!quit_msg_logged) {
             quit_msg_logged = true;
-            mta_logf("quit", "sinal 0x%04X -> hooks restaurados antes do disconnect", (unsigned)msg);
+            mta_logf("quit", "sinal 0x%04X: game_sa retirado, netc por ultimo, disconnect OK",
+                     (unsigned)msg);
         }
         return orig_at_entry
             ? CallWindowProc(orig_at_entry, hwnd, msg, wParam, lParam)
@@ -2517,7 +3020,9 @@ static LRESULT CALLBACK hk_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             : DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
+    if ((msg == WM_ACTIVATEAPP && wParam) || msg == WM_SETFOCUS) g_game_focused = true;
     if ((msg == WM_ACTIVATEAPP && !wParam) || msg == WM_KILLFOCUS) {
+        g_game_focused = false;
         InterlockedExchange(&g_silent_send_ok, 0);
         g_silent_aim_on = g_silent_has_target = false;
     }
@@ -2630,85 +3135,78 @@ static void apply_theme() {
     ImGuiStyle& s = ImGui::GetStyle();
     ImVec4* c = s.Colors;
 
-    const ImVec4 accent       = ImVec4(136/255.f, 100/255.f, 255/255.f, 1.00f);
-    const ImVec4 accent_hover = ImVec4(160/255.f, 130/255.f, 255/255.f, 1.00f);
-    const ImVec4 accent_dim   = ImVec4(100/255.f,  75/255.f, 200/255.f, 1.00f);
-    const ImVec4 accent_bg    = ImVec4(136/255.f, 100/255.f, 255/255.f, 0.25f);
+    c[ImGuiCol_Text]                  = ImVec4(205 / 255.f, 205 / 255.f, 208 / 255.f, 1.0f);
+    c[ImGuiCol_TextDisabled]          = ImVec4(128 / 255.f, 129 / 255.f, 134 / 255.f, 1.0f);
+    c[ImGuiCol_WindowBg]              = ImVec4(20 / 255.f, 20 / 255.f, 21 / 255.f, 1.0f);
+    c[ImGuiCol_ChildBg]               = ImVec4(26 / 255.f, 26 / 255.f, 28 / 255.f, 1.0f);
+    c[ImGuiCol_PopupBg]               = ImVec4(30 / 255.f, 30 / 255.f, 32 / 255.f, 1.0f);
+    c[ImGuiCol_Border]                = ImVec4(1.0f, 1.0f, 1.0f, 8 / 255.f);
+    c[ImGuiCol_BorderShadow]          = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 
-    c[ImGuiCol_Text]                  = ImVec4(0.90f, 0.90f, 0.92f, 1.00f);
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.47f, 0.47f, 0.51f, 1.00f);
-    c[ImGuiCol_WindowBg]              = ImVec4(0.05f, 0.05f, 0.06f, 0.98f);
-    c[ImGuiCol_ChildBg]               = ImVec4(0.07f, 0.07f, 0.09f, 1.00f);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.08f, 0.08f, 0.10f, 0.98f);
-    c[ImGuiCol_Border]                = ImVec4(0.16f, 0.16f, 0.19f, 1.00f);
-    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    c[ImGuiCol_FrameBg]               = ImVec4(35 / 255.f, 35 / 255.f, 38 / 255.f, 1.0f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(45 / 255.f, 45 / 255.f, 49 / 255.f, 1.0f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(54 / 255.f, 54 / 255.f, 58 / 255.f, 1.0f);
 
-    c[ImGuiCol_FrameBg]               = ImVec4(0.13f, 0.13f, 0.16f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.17f, 0.17f, 0.21f, 1.00f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.20f, 0.16f, 0.28f, 1.00f);
+    c[ImGuiCol_TitleBg]               = ImVec4(20 / 255.f, 20 / 255.f, 21 / 255.f, 1.0f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(26 / 255.f, 26 / 255.f, 28 / 255.f, 1.0f);
+    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(20 / 255.f, 20 / 255.f, 21 / 255.f, 1.0f);
+    c[ImGuiCol_MenuBarBg]             = ImVec4(26 / 255.f, 26 / 255.f, 28 / 255.f, 1.0f);
 
-    c[ImGuiCol_TitleBg]               = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
-    c[ImGuiCol_MenuBarBg]             = ImVec4(0.08f, 0.08f, 0.10f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.02f, 0.02f, 0.02f, 0.0f);
+    c[ImGuiCol_ScrollbarGrab]         = SCHEME_V;
+    c[ImGuiCol_ScrollbarGrabHovered]  = SCHEME_V;
+    c[ImGuiCol_ScrollbarGrabActive]   = SCHEME_V;
 
-    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.05f, 0.05f, 0.06f, 1.00f);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.20f, 0.20f, 0.24f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.30f, 0.30f, 0.35f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.40f, 0.40f, 0.45f, 1.00f);
+    c[ImGuiCol_CheckMark]             = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    c[ImGuiCol_SliderGrab]            = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
 
-    c[ImGuiCol_CheckMark]             = accent;
-    c[ImGuiCol_SliderGrab]            = accent;
-    c[ImGuiCol_SliderGrabActive]      = accent_hover;
+    c[ImGuiCol_Button]                = SCHEME_V;
+    c[ImGuiCol_ButtonHovered]         = SCHEME_HOVER_V;
+    c[ImGuiCol_ButtonActive]          = SCHEME_ACTIVE_V;
 
-    c[ImGuiCol_Button]                = ImVec4(0.16f, 0.13f, 0.24f, 1.00f);
-    c[ImGuiCol_ButtonHovered]         = accent_dim;
-    c[ImGuiCol_ButtonActive]          = accent;
+    c[ImGuiCol_Header]                = ImVec4(35 / 255.f, 35 / 255.f, 38 / 255.f, 1.0f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(242 / 255.f, 32 / 255.f, 51 / 255.f, 0.22f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(242 / 255.f, 32 / 255.f, 51 / 255.f, 0.35f);
 
-    c[ImGuiCol_Header]                = ImVec4(0.16f, 0.13f, 0.24f, 1.00f);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.20f, 0.16f, 0.30f, 1.00f);
-    c[ImGuiCol_HeaderActive]          = accent_dim;
+    c[ImGuiCol_Separator]             = ImVec4(1.0f, 1.0f, 1.0f, 10 / 255.f);
+    c[ImGuiCol_SeparatorHovered]      = SCHEME_V;
+    c[ImGuiCol_SeparatorActive]       = SCHEME_V;
 
-    c[ImGuiCol_Separator]             = ImVec4(0.16f, 0.16f, 0.19f, 1.00f);
-    c[ImGuiCol_SeparatorHovered]      = accent_dim;
-    c[ImGuiCol_SeparatorActive]       = accent;
+    c[ImGuiCol_ResizeGrip]            = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+    c[ImGuiCol_ResizeGripHovered]     = SCHEME_V;
+    c[ImGuiCol_ResizeGripActive]      = SCHEME_V;
 
-    c[ImGuiCol_ResizeGrip]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_ResizeGripHovered]     = accent_dim;
-    c[ImGuiCol_ResizeGripActive]      = accent;
+    c[ImGuiCol_Tab]                   = ImVec4(40 / 255.f, 41 / 255.f, 43 / 255.f, 1.0f);
+    c[ImGuiCol_TabHovered]            = SCHEME_V;
+    c[ImGuiCol_TabActive]             = SCHEME_HOVER_V;
 
-    c[ImGuiCol_Tab]                   = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.20f, 0.16f, 0.30f, 1.00f);
-    c[ImGuiCol_TabActive]             = ImVec4(0.16f, 0.13f, 0.24f, 1.00f);
+    c[ImGuiCol_PlotLines]             = SCHEME_V;
+    c[ImGuiCol_PlotLinesHovered]      = SCHEME_HOVER_V;
+    c[ImGuiCol_PlotHistogram]         = SCHEME_V;
+    c[ImGuiCol_PlotHistogramHovered]  = SCHEME_HOVER_V;
 
-    c[ImGuiCol_PlotLines]             = accent;
-    c[ImGuiCol_PlotLinesHovered]      = accent_hover;
-    c[ImGuiCol_PlotHistogram]         = accent;
-    c[ImGuiCol_PlotHistogramHovered]  = accent_hover;
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(242 / 255.f, 32 / 255.f, 51 / 255.f, 18 / 255.f);
+    c[ImGuiCol_NavHighlight]          = SCHEME_V;
 
-    c[ImGuiCol_TextSelectedBg]        = accent_bg;
-    c[ImGuiCol_NavHighlight]          = accent;
-
-    s.WindowPadding     = ImVec2(12, 12);
-    s.FramePadding      = ImVec2(8, 4);
-    s.ItemSpacing       = ImVec2(10, 8);
-    s.ItemInnerSpacing  = ImVec2(6, 6);
-    s.IndentSpacing     = 20.0f;
-    s.ScrollbarSize     = 6.0f;
-    s.GrabMinSize       = 10.0f;
-
-    s.WindowBorderSize  = 1.0f;
-    s.ChildBorderSize   = 1.0f;
-    s.PopupBorderSize   = 1.0f;
+    s.WindowRounding    = 0.0f;
+    s.WindowPadding     = ImVec2(0, 0);
+    s.WindowBorderSize  = 0.0f;
+    s.ChildRounding     = 4.0f;
+    s.ChildBorderSize   = 0.0f;
+    s.FrameRounding     = 3.0f;
+    s.FramePadding      = ImVec2(16, 14);
     s.FrameBorderSize   = 0.0f;
-
-    s.WindowRounding    = 10.0f;
-    s.ChildRounding     = 8.0f;
-    s.FrameRounding     = 4.0f;
-    s.PopupRounding     = 6.0f;
+    s.PopupRounding     = 3.0f;
+    s.PopupBorderSize   = 0.0f;
+    s.ItemSpacing       = ImVec2(20, 20);
+    s.ItemInnerSpacing  = ImVec2(10, 10);
     s.ScrollbarRounding = 4.0f;
-    s.GrabRounding      = 4.0f;
-    s.TabRounding       = 4.0f;
+    s.ScrollbarSize     = 4.0f;
+    s.GrabRounding      = 3.0f;
+    s.GrabMinSize       = 8.0f;
+    s.IndentSpacing     = 20.0f;
+    s.TabRounding       = 3.0f;
 
     s.AntiAliasedLines  = true;
     s.AntiAliasedFill   = true;
@@ -2753,6 +3251,8 @@ static void init_imgui(IDirect3DDevice9* pDevice) {
     if (!g_font_regular) g_font_regular = io.Fonts->AddFontDefault();
     g_font_header  = SafeLoadFont(arial_b, 22.0f);
     if (!g_font_header)  g_font_header  = g_font_regular;
+    g_font_tabs    = SafeLoadFont(arial_b, 14.0f);
+    if (!g_font_tabs)    g_font_tabs    = g_font_regular;
 
     g_font_esp_name = SafeLoadFont(arial_b, ESP_NAME_FONT_SIZE);
     if (!g_font_esp_name)
@@ -2790,9 +3290,9 @@ static void init_imgui(IDirect3DDevice9* pDevice) {
 
     g_o_wndproc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndproc);
     g_imgui_init = true;
-    mta_logf("ui", "ImGui pronto: hwnd=%p regular=%p header=%p esp=%p icons=%p",
+    mta_logf("ui", "ImGui pronto: hwnd=%p regular=%p header=%p tabs=%p esp=%p icons=%p",
              (void*)g_game_hwnd, (void*)g_font_regular, (void*)g_font_header,
-             (void*)g_font_esp_name, (void*)g_font_icons);
+             (void*)g_font_tabs, (void*)g_font_esp_name, (void*)g_font_icons);
 }
 
 struct Vec3 { float x, y, z; };
@@ -2806,6 +3306,14 @@ struct Vec3 { float x, y, z; };
 #define PED_OFF_PHYS_FLAGS   0x40
 #define PED_OFF_MOVE_SPEED   0x44
 #define PED_OFF_TURN_SPEED   0x50
+#define PED_OFF_WEAPONS      0x5A0
+#define PED_WEAPON_STRIDE    0x1C
+#define PED_OFF_WEAPON_SLOT  0x718
+#define PED_OFF_VEHICLE      0x58C
+#define W_OFF_TYPE           0x0
+#define W_OFF_CLIP           0x8
+#define W_OFF_TOTAL          0xC
+#define INFINITE_AMMO_VALUE  9999
 #define CMTX_OFF_POS         0x30
 
 using CPed_GetBonePosition_t = Vec3* (__thiscall*)(void* thisptr, Vec3* out, int boneId, bool includeAnim);
@@ -2838,7 +3346,7 @@ static uint32_t get_local_ped() {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 
     return 0;
-}	
+}
 
 static void fly_physics_end() {
     if (!g_fly_phys_saved) return;
@@ -2882,10 +3390,7 @@ static void fly_physics_apply(uint32_t ped, float fdx, float fdy, float fdz, flo
                      (unsigned)f, g_fly_hp_saved, g_fly_armor_saved);
         }
         *flags = (f & ~0x00000002u) | 0x00000004u;
-        // FIX streaming: preserva "velocidade aparente" para o GTA SA pre-carregar
-        // setores. Zerar mv/tv fazia o jogador teleportar em setores nao carregados,
-        // travando a thread principal 100-600ms (queda de FPS). Cap em 40 u/s
-        // (velocidade de carro rapido) para nao sobrecarregar o streaming.
+
         float vmag = sqrtf(fdx*fdx + fdy*fdy + fdz*fdz);
         if (vmag > 0.0001f && dt > 0.0001f) {
             float v = vmag / dt;
@@ -3088,6 +3593,86 @@ static ImU32 health_color_dynamic(float hp_pct) {
     return                     IM_COL32(255,   0,   0, 230);
 }
 
+static void infinite_ammo_update() {
+    if (!g_infinite_ammo) return;
+    if (InterlockedCompareExchange(&g_shutdown_all, 0, 0)) return;
+    if (!session_live()) return;
+    uint32_t ped = get_local_ped();
+    if (!is_valid_ptr(ped)) return;
+    __try {
+        uint8_t slot = *(uint8_t*)(ped + PED_OFF_WEAPON_SLOT);
+        if (slot > 12) return;
+        uint32_t w = ped + PED_OFF_WEAPONS + (uint32_t)slot * PED_WEAPON_STRIDE;
+        uint32_t type = *(uint32_t*)(w + W_OFF_TYPE);
+        if (type > 46) return;
+        uint32_t* clip  = (uint32_t*)(w + W_OFF_CLIP);
+        uint32_t* total = (uint32_t*)(w + W_OFF_TOTAL);
+        if (*clip  < INFINITE_AMMO_VALUE) *clip  = INFINITE_AMMO_VALUE;
+        if (*total < INFINITE_AMMO_VALUE) *total = INFINITE_AMMO_VALUE;
+        if (!g_ammo_logged) {
+            g_ammo_logged = true;
+            mta_logf("ammo", "infinite ammo ON: ped=%08X slot=%u type=%u -> clip/total=%d",
+                     (unsigned)ped, (unsigned)slot, (unsigned)type, (int)INFINITE_AMMO_VALUE);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+static void fly_car_update(float dt) {
+    if (!g_fly_car) { g_flycar_logged = false; return; }
+    if (InterlockedCompareExchange(&g_shutdown_all, 0, 0)) return;
+    if (!session_live()) return;
+    if (!bind_is_down(g_fly_key_vk)) return;
+    uint32_t ped = get_local_ped();
+    if (!is_valid_ptr(ped)) return;
+    uint32_t veh = 0;
+    __try { veh = *(uint32_t*)(ped + PED_OFF_VEHICLE); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!is_valid_ptr(veh)) return;
+    if (dt <= 0.0f || dt > 0.1f) dt = 1.0f / 60.0f;
+    __try {
+        uint32_t matrix = *(uint32_t*)(veh + PED_OFF_MATRIX);
+        if (!is_valid_ptr(matrix)) return;
+        float* pos = (float*)(matrix + CMTX_OFF_POS);
+        if (!(pos[0] > -16000.0f && pos[0] < 16000.0f &&
+              pos[1] > -16000.0f && pos[1] < 16000.0f &&
+              pos[2] > -5000.0f  && pos[2] < 10000.0f)) return;
+        float f = 0.0f, s = 0.0f, u = 0.0f;
+        if (bind_is_down('W')) f += 1.0f;
+        if (bind_is_down('S')) f -= 1.0f;
+        if (bind_is_down('D')) s += 1.0f;
+        if (bind_is_down('A')) s -= 1.0f;
+        if (bind_is_down(VK_SPACE))   u += 1.0f;
+        if (bind_is_down(VK_CONTROL)) u -= 1.0f;
+        float fwd[3] = { 0.0f, 1.0f, 0.0f };
+        float right[3] = { 1.0f, 0.0f, 0.0f };
+        bool cam_ok = false;
+        fly_camera_axes(pos, fwd, right, cam_ok);
+        float dx = s, dy = f, dz = u;
+        if (cam_ok) {
+            float flat = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1]);
+            if (flat > 0.0001f) {
+                dx = (fwd[0]/flat)*f + right[0]*s;
+                dy = (fwd[1]/flat)*f + right[1]*s;
+                dz = u + right[2]*s;
+            }
+        }
+        float len = sqrtf(dx*dx + dy*dy + dz*dz);
+        float* mv = (float*)(veh + PED_OFF_MOVE_SPEED);
+        if (len >= 0.0001f) {
+            float boost = bind_is_down(VK_SHIFT) ? 1.6f : 1.0f;
+            float sp = g_fly_speed * boost;
+            if (sp > 32.0f) sp = 32.0f;
+            mv[0] = dx/len*sp; mv[1] = dy/len*sp; mv[2] = dz/len*sp;
+        } else {
+            mv[0] *= 0.9f; mv[1] *= 0.9f; mv[2] *= 0.9f;
+        }
+        if (!g_flycar_logged) {
+            g_flycar_logged = true;
+            mta_logf("fly", "fly car ON: veh=%08X move-speed=%08X (W/S/A/D + Espaco/Ctrl, Shift boost)",
+                     (unsigned)veh, (unsigned)(veh + PED_OFF_MOVE_SPEED));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
 static void fly_update(float dt) {
     g_fly_active = false;
     if (InterlockedCompareExchange(&g_shutdown_all, 0, 0)) { fly_physics_end(); return; }
@@ -3121,6 +3706,7 @@ static void fly_update(float dt) {
         flying = down;
     }
     if (!flying) {
+        g_fly_veh_logged = false;
         g_fly_pitch_init = false;
         g_fly_pitch_axis = -1;
         fly_physics_end();
@@ -3136,11 +3722,27 @@ static void fly_update(float dt) {
     if (bind_is_down(VK_SPACE))   u += 1.0f;
     if (bind_is_down(VK_CONTROL)) u -= 1.0f;
     bool has_input = (f != 0.0f || s != 0.0f || u != 0.0f);
-    float boost = bind_is_down(VK_SHIFT) ? 2.0f : 1.0f;
+    float boost = bind_is_down(VK_SHIFT) ? 1.6f : 1.0f;
 
     if (dt <= 0.0f || dt > 0.1f) dt = 1.0f / 60.0f;
     uint32_t ped = get_local_ped();
     if (!is_valid_ptr(ped)) { fly_physics_end(); return; }
+    uint32_t in_veh = 0;
+    __try { in_veh = *(uint32_t*)(ped + PED_OFF_VEHICLE); } __except (EXCEPTION_EXECUTE_HANDLER) { in_veh = 0; }
+    if (is_valid_ptr(in_veh)) {
+        if (!g_fly_veh_logged) {
+            g_fly_veh_logged = true;
+            mta_logf("fly", "dentro do veiculo %08X: fly do ped NAO move o carro (ligue Fly Car, tecla vk=%d)",
+                     (unsigned)in_veh, (int)g_fly_key_vk);
+            notify_push("Fly", TROLL_ICON_GLYPH, true,
+                        g_fly_car ? "Fly Car: segure a tecla do Fly + W/S/A/D"
+                                  : "Voce esta num carro: ligue Fly Car");
+        }
+        g_fly_active = false;
+        fly_physics_end();
+        return;
+    }
+    g_fly_veh_logged = false;
     __try {
         uint32_t matrix = *(uint32_t*)(uintptr_t)(ped + PED_OFF_MATRIX);
         bool has_mtx = is_valid_ptr(matrix);
@@ -3179,49 +3781,23 @@ static void fly_update(float dt) {
         if (!cam_ok && has_input && mta_log_tick(6, 3000))
             mta_logf("fly", "sem view matrix: direcao pela matriz do ped");
 
-        float raw_fwd_z = cam_ok ? fwd[2] : 0.0f;
-        float cam_pitch  = fly_camera_pitch();
-        if (cam_ok && g_fly_pitch_axis != g_fly_axis_idx) {
-            g_fly_pitch_axis = g_fly_axis_idx;
-            g_fly_pitch_init = false;
-        }
-        if (cam_ok && cam_pitch > -0.03f && cam_pitch < 0.03f && !g_fly_pitch_init) {
-            // FIX: com camera horizontal, raw_fwd_z deveria ser ~sin(cam_pitch) ≈ cam_pitch.
-            // Se estiver muito longe, a view matrix esta stale (transicao de camera).
-            // Aceitar o valor envenenava o pitch_base e o fly voava na direcao errada
-            // (ex: -0.325 vs -0.030 no log), ampliando o streaming e travando a thread.
-            if (fabsf(raw_fwd_z - cam_pitch) < 0.15f) {
-                g_fly_pitch_base = raw_fwd_z;
-                g_fly_pitch_init = true;
-                mta_logf("fly", "pitch base=%.3f cp=%.3f (W horizontal; subir = olhar para cima ou Espaco)",
-                         (double)raw_fwd_z, (double)cam_pitch);
-            }
-        }
-
+        // Full 3D camera direction. Looking up + W = up at full speed,
+        // looking flat + W = horizontal, looking down + W = down. No
+        // flatten, no pitch_delta bias, no "W horizontal only" quirk.
         if (has_input) {
-            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-            float flat_len = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1]);
-            float pitch_delta = g_fly_pitch_init ? (raw_fwd_z - g_fly_pitch_base) : raw_fwd_z;
-            // FIX: delta de pitch fora da faixa plausivel = base corrompida.
-            // Reseta para re-init no proximo frame com camera horizontal.
-            if (g_fly_pitch_init && (pitch_delta > 0.8f || pitch_delta < -0.8f)) {
-                g_fly_pitch_init = false;
-                pitch_delta = 0.0f;
+            float dx, dy, dz;
+            if (cam_ok) {
+                dx = fwd[0]*f + right[0]*s;
+                dy = fwd[1]*f + right[1]*s;
+                dz = fwd[2]*f + right[2]*s + u;
+            } else {
+                dx = right[0]*s;
+                dy = f;
+                dz = u;
             }
-            if (pitch_delta >  1.0f) pitch_delta =  1.0f;
-            if (pitch_delta < -1.0f) pitch_delta = -1.0f;
-            if (cam_ok && flat_len > 0.0001f) {
-                float hx = fwd[0] / flat_len, hy = fwd[1] / flat_len;
-                dx = hx*f + right[0]*s;
-                dy = hy*f + right[1]*s;
-                dz = u + right[2]*s + f * pitch_delta * 1.5f;
-            } else { dx = s; dy = f; dz = u + f * pitch_delta * 1.5f; }
             float len = sqrtf(dx*dx + dy*dy + dz*dz);
             if (len >= 0.0001f) {
                 dx /= len; dy /= len; dz /= len;
-                if (!(dx > -3.0f && dx < 3.0f)) dx = 0.0f;
-                if (!(dy > -3.0f && dy < 3.0f)) dy = 0.0f;
-                if (!(dz > -3.0f && dz < 3.0f)) dz = 0.0f;
                 float step = g_fly_speed * boost * dt;
                 g_fly_hover_pos[0] += dx * step;
                 g_fly_hover_pos[1] += dy * step;
@@ -3230,53 +3806,35 @@ static void fly_update(float dt) {
         }
 
         {
-            static float prev_hover[3] = { 0.0f, 0.0f, 0.0f };
-            static bool  prev_ok = false;
-            // FIX streaming: limita o step por frame para o streaming do GTA SA
-            // acompanhar. Voar 24 u/s teleporta em setores nao carregados.
-            float mx = g_fly_hover_pos[0] - pos[0];
-            float my = g_fly_hover_pos[1] - pos[1];
-            float mz = g_fly_hover_pos[2] - pos[2];
-            float mlen = sqrtf(mx*mx + my*my + mz*mz);
-            float max_step = 60.0f * dt;
-            if (max_step < 1.0f) max_step = 1.0f;
-            if (mlen > max_step) {
-                float s = max_step / mlen;
-                g_fly_hover_pos[0] = pos[0] + mx * s;
-                g_fly_hover_pos[1] = pos[1] + my * s;
-                g_fly_hover_pos[2] = pos[2] + mz * s;
+            // Safety only: if hover drifted absurdly far (>400u) from the ped,
+            // resync. This is the ONLY correction path — no per-frame clamp,
+            // which was causing teleports when physics nudged pos past hover.
+            float ddx = g_fly_hover_pos[0] - pos[0];
+            float ddy = g_fly_hover_pos[1] - pos[1];
+            float ddz = g_fly_hover_pos[2] - pos[2];
+            if (ddx*ddx + ddy*ddy + ddz*ddz > 160000.0f) {
+                g_fly_hover_pos[0] = pos[0];
+                g_fly_hover_pos[1] = pos[1];
+                g_fly_hover_pos[2] = pos[2];
             }
-            // FIX streaming: delta real do fly (cap em 20 u para descartar
-            // teleport/reset do hover) vira velocidade aparente do ped.
-            float fdx = 0.0f, fdy = 0.0f, fdz = 0.0f;
-            if (prev_ok) {
-                fdx = g_fly_hover_pos[0] - prev_hover[0];
-                fdy = g_fly_hover_pos[1] - prev_hover[1];
-                fdz = g_fly_hover_pos[2] - prev_hover[2];
-                float fmag = sqrtf(fdx*fdx + fdy*fdy + fdz*fdz);
-                if (fmag > 20.0f) { fdx = fdy = fdz = 0.0f; }
-            }
-            prev_hover[0] = g_fly_hover_pos[0];
-            prev_hover[1] = g_fly_hover_pos[1];
-            prev_hover[2] = g_fly_hover_pos[2];
-            prev_ok = true;
+
+            // Snap ped = hover exactly. Passing 0,0,0 to fly_physics_apply
+            // zeroes mv/tv so physics can't double-move the ped between frames
+            // (that double-move was the source of the stutter/teleport).
+            // Position is 100% driven by our snap; hover advances by input*dt.
             pos[0] = g_fly_hover_pos[0];
             pos[1] = g_fly_hover_pos[1];
             pos[2] = g_fly_hover_pos[2];
-            fly_physics_apply(ped, fdx, fdy, fdz, dt);
+            fly_physics_apply(ped, 0.0f, 0.0f, 0.0f, dt);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_fly_active = false; }
 }
-
 
 #define ADDR_PED_POOL        0xB74490
 #define POOL_OBJ_OFF         0x00
 #define POOL_FLAG_OFF        0x04
 #define POOL_SIZE_OFF        0x08
 #define PED_STRIDE           0x7C4
-
-//            codigo-fonte oficial do MTA:SA
-//            https://github.com/multitheftauto/mtasa-blue
 
 #define MTA_MAX_VEHICLES       110
 #define MTA_MAX_PEDS           140
@@ -3821,6 +4379,102 @@ static bool get_ped_nickname(int pool_idx, uint32_t ped_interface, bool is_local
     return result;
 }
 
+static uint32_t find_ped_by_name(const char* name) {
+    if (!name || !name[0]) return 0;
+    uint32_t local_ped = get_local_ped();
+    uint32_t found = 0;
+    __try {
+        uint32_t pool = *(uint32_t*)ADDR_PED_POOL;
+        if (is_valid_ptr(pool)) {
+            uint32_t objects = *(uint32_t*)(pool + POOL_OBJ_OFF);
+            uint32_t flags   = *(uint32_t*)(pool + POOL_FLAG_OFF);
+            uint32_t size    = *(uint32_t*)(pool + POOL_SIZE_OFF);
+            if (is_valid_ptr(objects) && is_valid_ptr(flags) && size > 0) {
+                if (size > 256) size = 256;
+                for (uint32_t i = 0; i < size; ++i) {
+                    uint8_t flag = *(uint8_t*)(flags + i);
+                    if (flag & 0x80) continue;
+                    uint32_t ped = objects + i * PED_STRIDE;
+                    if (!is_valid_ptr(ped) || ped == local_ped) continue;
+                    char nick[64] = {};
+                    if (get_ped_nickname((int)i, ped, false, nick, sizeof(nick)) &&
+                        mta_stricmp(nick, name) == 0) {
+                        found = ped;
+                        break;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return found;
+}
+
+static uint32_t resolve_troll_ped() {
+    if (is_valid_ptr(g_troll_submenu_ped)) {
+        char nick[64] = {};
+        if (get_ped_nickname(-1, g_troll_submenu_ped, false, nick, sizeof(nick)) &&
+            mta_stricmp(nick, g_troll_submenu_name) == 0)
+            return g_troll_submenu_ped;
+    }
+    g_troll_submenu_ped = find_ped_by_name(g_troll_submenu_name);
+    return g_troll_submenu_ped;
+}
+
+static void explode_at_pos(const Vec3& pos, int type, float radius) {
+    using fn_add_explosion = void(__cdecl*)(const Vec3*, int, float, bool, bool, float);
+    __try {
+        fn_add_explosion fn = (fn_add_explosion)(uintptr_t)ADDR_EXPLOSION_ADD;
+        fn(&pos, type, radius, true, true, 1.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void troll_explode(uint32_t ped) {
+    Vec3 pos;
+    if (!get_ped_world_pos(ped, pos)) {
+        notify_push("Troll", TROLL_ICON_GLYPH, false, "Alvo fora do mundo");
+        return;
+    }
+    pos.z += 0.4f;
+    explode_at_pos(pos, EXPLOSION_GRENADE, TROLL_EXPLODE_RADIUS);
+    mta_logf("troll", "explode ped=%08X pos=%.1f,%.1f,%.1f", (unsigned)ped,
+             (double)pos.x, (double)pos.y, (double)pos.z);
+    notify_push("Troll", TROLL_ICON_GLYPH, true, "Explosao em %s", g_troll_submenu_name);
+}
+
+static void troll_fire(uint32_t ped) {
+    Vec3 pos;
+    if (!get_ped_world_pos(ped, pos)) {
+        notify_push("Troll", TROLL_ICON_GLYPH, false, "Alvo fora do mundo");
+        return;
+    }
+    pos.z += 0.4f;
+    explode_at_pos(pos, EXPLOSION_MOLOTOV, TROLL_FIRE_RADIUS);
+    mta_logf("troll", "fire ped=%08X pos=%.1f,%.1f,%.1f", (unsigned)ped,
+             (double)pos.x, (double)pos.y, (double)pos.z);
+    notify_push("Troll", TROLL_ICON_GLYPH, true, "Molotov em %s", g_troll_submenu_name);
+}
+
+static void troll_spectate(uint32_t ped) {
+    if (!is_valid_ptr(ped)) return;
+    __try {
+        *(uint32_t*)ADDR_CAMERA_TARGET_PED = ped;
+        g_spectate_ped    = ped;
+        g_spectate_active = true;
+        mta_logf("troll", "spectate attach ped=%08X", (unsigned)ped);
+        notify_push("Troll", TROLL_ICON_GLYPH, true, "Espectando %s", g_troll_submenu_name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void troll_spectate_stop() {
+    __try {
+        uint32_t me = get_local_ped();
+        *(uint32_t*)ADDR_CAMERA_TARGET_PED = is_valid_ptr(me) ? me : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_spectate_active = false;
+    g_spectate_ped    = 0;
+    mta_logf("troll", "spectate detach");
+}
+
 static void esp_draw_text_outlined(ImDrawList* dl, ImFont* font, float size,
                                    const ImVec2& p, ImU32 col, const char* txt) {
     if (!dl || !txt || !*txt) return;
@@ -3838,6 +4492,7 @@ static void esp_draw_text_outlined(ImDrawList* dl, ImFont* font, float size,
 
 static void draw_esp_for_ped(IDirect3DDevice9* dev, uint32_t ped, bool is_local, const char* name,
                              bool show_box, float col_box[4], bool show_box_filled,
+                             bool show_box_corner, bool show_box_rounded,
                              bool show_lines, float col_lines[3],
                              bool show_names, float col_names[3],
                              bool show_health, float col_health[3], bool show_health_dynamic,
@@ -3916,10 +4571,21 @@ static void draw_esp_for_ped(IDirect3DDevice9* dev, uint32_t ped, bool is_local,
     ImU32 c_dist = IM_COL32((int)(col_distance[0]*255), (int)(col_distance[1]*255), (int)(col_distance[2]*255), 255);
 
     if (show_box) {
-        if (show_box_filled) {
-            dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom), c_box);
+        float rr = show_box_rounded ? 6.0f : 0.0f;
+        if (show_box_corner) {
+            float cl = ImMin(box_w, box_h) * 0.30f;
+            dl->AddLine(ImVec2(left, top),  ImVec2(left + cl, top),  c_box, 1.5f);
+            dl->AddLine(ImVec2(left, top),  ImVec2(left, top + cl),  c_box, 1.5f);
+            dl->AddLine(ImVec2(right, top), ImVec2(right - cl, top), c_box, 1.5f);
+            dl->AddLine(ImVec2(right, top), ImVec2(right, top + cl), c_box, 1.5f);
+            dl->AddLine(ImVec2(left, bottom),  ImVec2(left + cl, bottom),  c_box, 1.5f);
+            dl->AddLine(ImVec2(left, bottom),  ImVec2(left, bottom - cl),  c_box, 1.5f);
+            dl->AddLine(ImVec2(right, bottom), ImVec2(right - cl, bottom), c_box, 1.5f);
+            dl->AddLine(ImVec2(right, bottom), ImVec2(right, bottom - cl), c_box, 1.5f);
+        } else if (show_box_filled) {
+            dl->AddRectFilled(ImVec2(left, top), ImVec2(right, bottom), c_box, rr);
         } else {
-            dl->AddRect(ImVec2(left, top), ImVec2(right, bottom), c_box, 0.0f, 0, 1.5f);
+            dl->AddRect(ImVec2(left, top), ImVec2(right, bottom), c_box, rr, 0, 1.5f);
         }
     }
 
@@ -3946,26 +4612,23 @@ static void draw_esp_for_ped(IDirect3DDevice9* dev, uint32_t ped, bool is_local,
     const float esp_fs = ESP_NAME_FONT_SIZE;
 
     if (show_names && name && name[0]) {
+        char label[112] = {};
+        if (show_distance)
+            snprintf(label, sizeof(label), "%s [%.1fm]", name, dist_m);
+        else
+            snprintf(label, sizeof(label), "%s", name);
         if (esp_font) {
-            ImVec2 sz = esp_font->CalcTextSizeA(esp_fs, FLT_MAX, 0.0f, name);
+            ImVec2 sz = esp_font->CalcTextSizeA(esp_fs, FLT_MAX, 0.0f, label);
             ImVec2 p(bx - sz.x * 0.5f, top - sz.y - 4.0f);
-            esp_draw_text_outlined(dl, esp_font, esp_fs, p, c_name, name);
+            esp_draw_text_outlined(dl, esp_font, esp_fs, p, c_name, label);
         }
-    }
-
-    if (show_distance && esp_font) {
-        char dbuf[32] = {};
-        snprintf(dbuf, sizeof(dbuf), "%.0fm", dist_m);
-        ImVec2 sz = esp_font->CalcTextSizeA(esp_fs, FLT_MAX, 0.0f, dbuf);
-        ImVec2 p(bx - sz.x * 0.5f, bottom + 4.0f);
-        esp_draw_text_outlined(dl, esp_font, esp_fs, p, c_dist, dbuf);
     }
 
     if (show_health && max_hp > 0.0f) {
         float f = hp / max_hp;
         if (f < 0.0f) f = 0.0f;
         if (f > 1.0f) f = 1.0f;
-        float bar_w = 3.0f, pad = 3.0f, bx_l = left - bar_w - pad;
+        float bar_w = 8.0f, pad = 3.0f, bx_l = left - bar_w - pad - 5.0f;
 
         ImU32 hp_fill = show_health_dynamic ? health_color_dynamic(f) : c_hp;
 
@@ -3983,7 +4646,7 @@ static void draw_esp_for_ped(IDirect3DDevice9* dev, uint32_t ped, bool is_local,
     if (show_armor && armor > 0.0f) {
         float f = armor / 100.0f;
         if (f > 1.0f) f = 1.0f;
-        float bar_w = 3.0f, pad = 3.0f, bx_r = right + pad;
+        float bar_w = 3.0f, pad = 3.0f, bx_r = right + pad + 5.0f;
         dl->AddRectFilled(ImVec2(bx_r, top), ImVec2(bx_r + bar_w, bottom), IM_COL32(20, 20, 20, 200));
         float h = (bottom - top) * f;
         dl->AddRectFilled(ImVec2(bx_r, bottom - h), ImVec2(bx_r + bar_w, bottom), c_arm);
@@ -4026,6 +4689,7 @@ static void draw_esp_all_players(IDirect3DDevice9* dev) {
             if (g_esp_local_enable)
                 draw_esp_for_ped(dev, ped, true, name,
                     g_esp_local_box,    g_col_local_box,    g_esp_local_box_filled,
+                    g_esp_local_box_corner, g_esp_local_box_rounded,
                     g_esp_local_lines,  g_col_local_lines,
                     g_esp_local_names,  g_col_local_names,
                     g_esp_local_health, g_col_local_health, g_esp_local_health_dynamic,
@@ -4036,6 +4700,7 @@ static void draw_esp_all_players(IDirect3DDevice9* dev) {
             if (g_esp_players_enable)
                 draw_esp_for_ped(dev, ped, false, name,
                     g_esp_players_box,    g_col_players_box,    g_esp_players_box_filled,
+                    g_esp_players_box_corner, g_esp_players_box_rounded,
                     g_esp_players_lines,  g_col_players_lines,
                     g_esp_players_names,  g_col_players_names,
                     g_esp_players_health, g_col_players_health, g_esp_players_health_dynamic,
@@ -4221,11 +4886,11 @@ static bool los_clear(const Vec3& a, const Vec3& b) {
     if (!los_available()) {
         if (!g_los_logged) {
             g_los_logged = true;
-            mta_logf("silent", "LOS %08X indisponivel: alvo bloqueado por seguranca",
+            mta_logf("los", "LOS %08X indisponivel: fail-open, parede NAO bloqueia o silent",
                      (unsigned)FUNC_WORLD_IS_LOS_CLEAR);
         }
         g_los_have_cache = false;
-        return false;
+        return true;
     }
     uint32_t now = GetTickCount();
     if (los_same_target(a, b) && g_los_tick &&
@@ -4233,8 +4898,15 @@ static bool los_clear(const Vec3& a, const Vec3& b) {
     g_los_cached = false;
     __try {
         fn_world_los f = (fn_world_los)(uintptr_t)FUNC_WORLD_IS_LOS_CLEAR;
-        g_los_cached = f(&a, &b, 1, 1, 0, 1, 1, 0, 0) ? true : false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_los_cached = false; }
+        g_los_cached = f(&a, &b, 1, 1, 0, 0, 0, 1, 0) ? true : false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_los_cached = true;
+        if (!g_los_logged) {
+            g_los_logged = true;
+            mta_logf("los", "LOS %08X lancou excecao: fail-open, parede NAO bloqueia o silent",
+                     (unsigned)FUNC_WORLD_IS_LOS_CLEAR);
+        }
+    }
     g_los_tick = now ? now : 1;
     g_los_cache_a[0] = a.x; g_los_cache_a[1] = a.y; g_los_cache_a[2] = a.z;
     g_los_cache_b[0] = b.x; g_los_cache_b[1] = b.y; g_los_cache_b[2] = b.z;
@@ -4247,7 +4919,8 @@ static void silent_update(IDirect3DDevice9* dev) {
     InterlockedExchange(&g_silent_send_ok, 0);
     if (!session_live()) { g_silent_aim_on = false; return; }
     g_silent_aim_on = g_silent_enable &&
-        ((GetAsyncKeyState(g_silent_key_vk) & 0x8000) != 0);
+        ((GetAsyncKeyState(g_silent_key_vk) & 0x8000) != 0 ||
+         (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);  // fire tambem arma
     if (!g_silent_enable || !g_silent_aim_on || g_menu_open ||
         g_silent_capturing || !dev) return;
     HWND fg = GetForegroundWindow();
@@ -4262,6 +4935,8 @@ static void silent_update(IDirect3DDevice9* dev) {
     const uint32_t local_ped = get_local_ped();
     float best_d2 = radius * radius;
     bool found = false;
+    uint32_t best_ped = 0;
+    const int sel_bone = (g_silent_bone >= 0 && g_silent_bone < 7) ? g_silent_bone : 0;
 
     __try {
         uint32_t pool = *(uint32_t*)ADDR_PED_POOL;
@@ -4291,6 +4966,7 @@ static void silent_update(IDirect3DDevice9* dev) {
                     float d2 = ddx * ddx + ddy * ddy;
                     if (d2 < best_d2) {
                         best_d2 = d2;
+                        best_ped = ped;
                         g_silent_target_sx = sx;
                         g_silent_target_sy = sy;
                         g_silent_aim_point[0] = aim.x;
@@ -4302,24 +4978,47 @@ static void silent_update(IDirect3DDevice9* dev) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
-    if (found && !g_silent_ignore_walls) {
+    if (found && g_silent_ignore_walls) {
+        g_los_have_cache = false;
+    } else if (found && best_ped) {
         Vec3 src;
         Vec3 dst;
         dst.x = g_silent_aim_point[0];
         dst.y = g_silent_aim_point[1];
         dst.z = g_silent_aim_point[2];
-        if (!get_ped_world_pos(local_ped, src)) found = false;
-        else {
+        if (!get_ped_world_pos(local_ped, src)) {
+            found = false;
+        } else {
             src.z += 1.0f;
-            if (!los_clear(src, dst)) found = false;
+            int used = -1;
+            if (los_clear(src, dst)) {
+                used = sel_bone;
+            } else {
+                for (int k = 1; k < 7 && used < 0; ++k) {
+                    int bi = (sel_bone + k) % 7;
+                    Vec3 alt;
+                    if (!get_bone_pos(best_ped, AIMBOT_BONE_IDS[bi], alt)) continue;
+                    if (!los_clear(src, alt)) continue;
+                    g_silent_aim_point[0] = alt.x;
+                    g_silent_aim_point[1] = alt.y;
+                    g_silent_aim_point[2] = alt.z;
+                    used = bi;
+                }
+            }
+            if (used < 0) found = false;
         }
     }
     g_silent_has_target = found;
     InterlockedExchange(&g_silent_send_ok,
         (found && session_live() && !conn_handshake_active() && !g_menu_open &&
          !InterlockedCompareExchange(&g_shutdown_all, 0, 0)) ? 1 : 0);
+    if (mta_log_tick(4, 500))
+        mta_logf("silent", "upd enable=%d on=%d found=%d ok=%d live=%d menu=%d hs=%d",
+                 g_silent_enable ? 1 : 0, g_silent_aim_on ? 1 : 0,
+                 found ? 1 : 0, (int)g_silent_send_ok,
+                 session_live() ? 1 : 0, g_menu_open ? 1 : 0,
+                 conn_handshake_active() ? 1 : 0);
 }
-
 
 static __declspec(naked) void hk_mta_fire_mid() {
     __asm {
@@ -4365,7 +5064,7 @@ static bool silent_patch_mid(uint32_t pos, void* detour, void** mta_hook) {
         uint32_t dest = pos + 5 + (uint32_t)rel;
         if (dest < 0x10000u || dest > 0x7FFFFFFFu) return false;
         *mta_hook = (void*)(uintptr_t)dest;
-        if (g_patch_count >= 60) return false;
+        if (g_patch_count >= 92) return false;
         DWORD oldp = 0;
         if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) return false;
         PatchRecord& pr = g_patches[g_patch_count];
@@ -4383,6 +5082,9 @@ static bool silent_patch_mid(uint32_t pos, void* detour, void** mta_hook) {
 
 static void silent_install_mid_hooks() {
     if (!g_silent_mid_ok) {
+        uint8_t b0 = 0;
+        __try { b0 = *(uint8_t*)(uintptr_t)MTA_FIRE_MID_POS; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        mta_logf("silent", "mid %08X byte0=%02X (E9 esperado)", (unsigned)MTA_FIRE_MID_POS, (unsigned)b0);
         void* det = (void*)(uintptr_t)&hk_mta_fire_mid;
         if (silent_patch_mid(MTA_FIRE_MID_POS, det, &g_o_mta_fire_mid)) {
             g_silent_mid_ok = true;
@@ -4439,7 +5141,7 @@ static __declspec(naked) void hk_fire_instant_hit() {
 
 static void silent_retire_hooks() {
     int w = 0;
-    for (int i = 0; i < g_patch_count && i < 64; ++i) {
+    for (int i = 0; i < g_patch_count && i < 96; ++i) {
         PatchRecord pr = g_patches[i];
         uint32_t a = (uint32_t)(uintptr_t)pr.addr;
         if (a != SILENT_FIRE_INSTANT_HIT && a != MTA_FIRE_MID_POS &&
@@ -4470,7 +5172,7 @@ static void silent_retire_hooks() {
 
 static void silent_install_hook() {
     if (g_silent_hook_ok) return;
-    if (g_patch_count >= 60) return;
+    if (g_patch_count >= 92) return;
     uint8_t* p = (uint8_t*)(uintptr_t)SILENT_FIRE_INSTANT_HIT;
     __try {
         uint8_t b = p[0];
@@ -4639,15 +5341,47 @@ static void aimbot_run(IDirect3DDevice9* dev) {
 #endif
 }
 
+static volatile LONG g_render_faults     = 0;
+static volatile LONG g_d3d_reset_count   = 0;
+static volatile LONG g_reset_storm       = 0;
+static uint32_t      g_reset_window_tick = 0;
+static int           g_reset_window_n    = 0;
+static uint32_t      g_ammo_last_tick    = 0;
+static uint32_t      g_frame_idx         = 0;
+static uint64_t      g_us_gameplay = 0;
+static uint64_t      g_us_ui       = 0;
+static uint64_t      g_us_present  = 0;
+static uint32_t      g_us_frames   = 0;
+static uint64_t      g_qpc_freq    = 0;
+
+static uint64_t now_us() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    if (!g_qpc_freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_qpc_freq = f.QuadPart ? (uint64_t)f.QuadPart : 1ull;
+    }
+    return (uint64_t)c.QuadPart * 1000000ull / g_qpc_freq;
+}
+
 static HRESULT __stdcall hk_Reset(IDirect3DDevice9* pDevice, D3DPRESENT_PARAMETERS* pParams) {
     g_have_3d = false;
-    // Reset pode trocar o modo (windowed <-> fullscreen): forca reaplicar WDA
-    g_stream_proof_hwnd    = nullptr;
-    g_stream_proof_applied = WDA_NONE_VALUE;
-    g_stream_proof_last_try = 0;
+    uint32_t rnow = GetTickCount();
+    if (rnow - g_reset_window_tick > 5000) {
+        g_reset_window_tick = rnow ? rnow : 1;
+        g_reset_window_n    = 0;
+        InterlockedExchange(&g_reset_storm, 0);
+    }
+    g_reset_window_n++;
+    InterlockedIncrement(&g_d3d_reset_count);
+    bool storm = (g_reset_window_n > 30);
+    if (storm && InterlockedCompareExchange(&g_reset_storm, 1, 0) == 0)
+        mta_logf("d3d", "RESET STORM: %d resets em 5s; atlas nao sera recriado ate acalmar",
+                 g_reset_window_n);
     if (g_imgui_init) ImGui_ImplDX9_InvalidateDeviceObjects();
     HRESULT hr = g_o_Reset(pDevice, pParams);
-    if (SUCCEEDED(hr) && g_imgui_init) {
+    if (SUCCEEDED(hr) && g_imgui_init && !storm) {
         ImGui_ImplDX9_CreateDeviceObjects();
         InterlockedExchange(&g_imgui_invalidated, 0);
     }
@@ -4752,8 +5486,10 @@ static void sess_disable_all() {
     g_cfg_pending_overwrite = false; g_cfg_pending_delete = false;
 
     session_fail_closed(5);
+    // Last resort: if disconnect detection missed, retire on main-menu
+    // snapshot. game_sa returns to vanilla before next join hash.
     silent_retire_hooks();
-    ClipCursor(nullptr);
+    ClipCursor(nullptr);	
     mta_logf("conn", "desconectado/main menu: %d opcoes desligadas (snapshot salvo)", CFG_ENTRY_COUNT);
 }
 
@@ -4776,7 +5512,7 @@ static void sess_restore_all() {
     g_silent_fov_size = cfg_clampf(g_silent_fov_size, 1.0f, 900.0f);
     g_silent_bone = g_silent_bone < 0 ? 0 : (g_silent_bone > 6 ? 6 : g_silent_bone);
     g_fly_mode = (g_fly_mode == FLY_MODE_TOGGLE) ? FLY_MODE_TOGGLE : FLY_MODE_HOLD;
-    g_fly_speed = cfg_clampf(g_fly_speed, 1.0f, 60.0f);
+    g_fly_speed = cfg_clampf(g_fly_speed, 0.5f, 20.0f);
     bind_format_key(g_menu_key_vk, g_menu_key_name, sizeof(g_menu_key_name));
     bind_format_key(g_fly_key_vk,  g_fly_key_name,  sizeof(g_fly_key_name));
     bind_format_key(g_silent_key_vk, g_silent_key_name, sizeof(g_silent_key_name));
@@ -4795,42 +5531,27 @@ static void reconnect_guard() {
     uint32_t base = (uint32_t)(uintptr_t)cur;
     uint32_t size = netc_image_size(cur);
     uint32_t old_base = g_netc_base;
-    uint32_t now = GetTickCount();
     if (!g_netc_base && base) {
         g_netc_base = base;
         g_netc_size = size;
         return;
     }
+    // netc is pinned: it can never unload, and can never be re-mapped at a
+    // different base. If either fires, the process is already corrupt.
+    // Reinstall would patch a dead page or a foreign map — exactly the
+    // pattern the AC bans on. Hold stale patches, log hard, do nothing.
     if (old_base && !base) {
-        if (!g_netc_needs_reinstall) {
-            session_fail_closed(1);
-            arm_switch_park(now);
-            netc_retire_stale_patches(0, 0);
-            g_conn_grace = 0;
-            if (!g_netc_unload_logged) {
-                g_netc_unload_logged = true;
-                mta_logf("conn", "netc descarregado: hooks restaurados e park iniciado, aguardando reload");
-            }
+        if (!g_netc_unload_logged) {
+            g_netc_unload_logged = true;
+            mta_logf("conn!", "netc VANISHED past PIN — refusing park/reinstall, "
+                              "%d patches held stale", (int)g_patch_count);
         }
-    } else if (old_base && base && (g_netc_needs_reinstall || base != old_base)) {
-        if (!g_switch_rebase_seen) {
-            session_fail_closed(2);
-            arm_switch_park(now);
-            bool moved = (base != old_base);
-            netc_rebase_patches(base, size);
-            if (moved) {
-                ++g_install_generation;
-                install_all();
-            }
-            g_switch_rebase_seen = true;
-            g_conn_grace = now ? now : 1;
-            g_session_fail_logged = false;
-            if (!g_netc_rebase_logged) {
-                g_netc_rebase_logged = true;
-                mta_logf("conn", "netc %s %08X -> %08X: reinstall adiado para depois do handshake",
-                         moved ? "realocado" : "recarregado",
-                         (unsigned)old_base, (unsigned)base);
-            }
+    } else if (old_base && base && base != old_base) {
+        if (!g_netc_rebase_logged) {
+            g_netc_rebase_logged = true;
+            mta_logf("conn!", "netc REBASED past PIN %08X -> %08X — refusing reinstall, "
+                              "patches on old map will miss",
+                     (unsigned)old_base, (unsigned)base);
         }
     }
     if (g_conn_grace && !conn_handshake_active())
@@ -4847,23 +5568,19 @@ static void session_monitor() {
     g_server_kick_seen = 0;
     bool quarantined = g_quarantine_until &&
         (now - g_quarantine_until < RECONNECT_QUARANTINE_MS);
-    bool parked = g_switch_park_until &&
-        (int32_t)(g_switch_park_until - now) > 0;
-    if (!parked && g_netc_needs_reinstall && g_netc_base) {
-        g_netc_needs_reinstall = false;
-        g_switch_rebase_seen = false;
-        unpark_netc_hooks();
-        mta_logf("safe", "troca de servidor: handshake concluido, trajetoria pode voltar");
-    }
-    if (!parked) g_switch_park_until = 0;
-    bool live = active && !parked && !conn_handshake_active() && !quarantined &&
-        !g_sess_saved && !g_netc_needs_reinstall &&
-        g_netc_base && g_sess_stable >= 8 &&
+    // netc pinned: no park, no rebase, no reinstall. Session live when the
+    // server is up, handshake done, and netc still at the pinned base.
+    bool live = active && !conn_handshake_active() && !quarantined &&
+        !g_sess_saved && g_netc_base && g_sess_stable >= 8 &&
         !InterlockedCompareExchange(&g_emergency_done, 0, 0);
     if (live) {
         InterlockedExchange(&g_session_live, 1);
         g_session_live_tick = now ? now : 1;
         g_fail_clean_done = false;
+        // Reinstala hooks do silent apos disconnect/reconnect. Sem isso,
+        // silent_retire_hooks() no packet 33 remove tudo e nada religa.
+        // mid hooks retry: silent_patch_mid so instala quando MTA ja tomou
+        // MTA_FIRE_MID_POS (p[0]==E9); se falhou no boot, tenta de novo aqui.
         if (!g_silent_hook_ok) silent_install_hook();
         if (!g_silent_mid_ok || !g_silent_sniper_ok) silent_install_mid_hooks();
     } else {
@@ -4878,9 +5595,11 @@ static void session_monitor() {
         rapid_fire_restore();
         fly_physics_end();
         session_fail_closed(3);
+        // Backup: if packet 33 path missed (crash, force-close, network
+        // drop), retire here so game_sa is clean before next join.
         silent_retire_hooks();
         g_silent_capturing = false;
-        mta_logf("conn", "desconectado: trajetoria, animacao e fisica restauradas antes do proximo servidor");
+        mta_logf("conn", "desconectado: silent hooks restaurados antes do proximo servidor");
     }
     g_conn_prev_active = active;
     if (active == g_sess_last_raw) {
@@ -5151,6 +5870,12 @@ static HRESULT __stdcall hk_EndScene(IDirect3DDevice9* pDevice) {
 
     session_monitor();
 
+    if (!g_game_focused) {
+        g_have_3d = false;
+        InterlockedExchange(&g_silent_send_ok, 0);
+        return g_o_EndScene(pDevice);
+    }
+
     if (!render_frame_ok()) {
         g_have_3d = false;
         InterlockedExchange(&g_silent_send_ok, 0);
@@ -5190,6 +5915,27 @@ static HRESULT __stdcall hk_EndScene(IDirect3DDevice9* pDevice) {
     }
 
     stream_proof_apply();
+    g_frame_idx++;
+    if (InterlockedCompareExchange(&g_reset_storm, 0, 0) ||
+        InterlockedCompareExchange(&g_imgui_invalidated, 0, 0)) {
+        static uint32_t s_lost_last = 0;
+        uint32_t lt = GetTickCount();
+        float ldt = ImClamp((float)(lt - s_lost_last) * 0.001f, 0.0f, 0.1f);
+        s_lost_last = lt ? lt : 1;
+        __try {
+            fly_update(ldt);
+            uint32_t at0 = GetTickCount();
+            if (at0 - g_ammo_last_tick >= 150) {
+                g_ammo_last_tick = at0 ? at0 : 1;
+                infinite_ammo_update();
+            }
+            fly_car_update(ldt);
+            rapid_fire_update();
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            InterlockedIncrement(&g_render_faults);
+        }
+        return g_o_EndScene(pDevice);
+    }
     ImGui::GetIO().MouseDrawCursor = g_menu_open;
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -5199,38 +5945,85 @@ static HRESULT __stdcall hk_EndScene(IDirect3DDevice9* pDevice) {
     ImGui::NewFrame();
     if (mta_log_tick(2, 5000)) {
         ImGuiIO& io = ImGui::GetIO();
-        mta_logf("fps", "fps=%.1f dt=%.1fms patches=%d repatch=%d menu=%d shutdown=%d",
+        double fdiv = g_us_frames ? (double)g_us_frames : 1.0;
+        mta_logf("fps", "fps=%.1f dt=%.1fms gp=%.2fms ui=%.2fms rd=%.2fms patches=%d repatch=%d menu=%d faults=%d resets=%d storm=%d shutdown=%d",
                  (double)io.Framerate, (double)(io.DeltaTime * 1000.0f),
+                 (double)((double)g_us_gameplay / fdiv / 1000.0),
+                 (double)((double)g_us_ui / fdiv / 1000.0),
+                 (double)((double)g_us_present / fdiv / 1000.0),
                  (int)g_patch_count,
                  (int)InterlockedCompareExchange(&g_watchdog_repatch_count, 0, 0),
                  g_menu_open ? 1 : 0,
+                 (int)InterlockedExchange(&g_render_faults, 0),
+                 (int)InterlockedExchange(&g_d3d_reset_count, 0),
+                 (int)InterlockedCompareExchange(&g_reset_storm, 0, 0),
                  (int)InterlockedCompareExchange(&g_shutdown_all, 0, 0));
+        g_us_gameplay = 0;
+        g_us_ui       = 0;
+        g_us_present  = 0;
+        g_us_frames   = 0;
     }
 
     const bool handshake = conn_handshake_active();
+    uint64_t t0 = now_us();
+    bool heavy = (ImGui::GetIO().Framerate >= 45.0f) || ((g_frame_idx & 1u) == 0u);
     if (!handshake) {
-        draw_esp_all_players(pDevice);
-        fly_update(ImGui::GetIO().DeltaTime);
-        rapid_fire_update();
-        aimbot_run(pDevice);
-        silent_update(pDevice);
+        __try {
+            if (heavy) draw_esp_all_players(pDevice);
+            fly_update(ImGui::GetIO().DeltaTime);
+            uint32_t at1 = GetTickCount();
+            if (at1 - g_ammo_last_tick >= 150) {
+                g_ammo_last_tick = at1 ? at1 : 1;
+                infinite_ammo_update();
+            }
+            fly_car_update(ImGui::GetIO().DeltaTime);
+            rapid_fire_update();
+            if (heavy) {
+                aimbot_run(pDevice);
+                silent_update(pDevice);
+            }
+            if (g_spectate_active) {
+                if (!is_valid_ptr(g_spectate_ped)) {
+                    troll_spectate_stop();
+                } else {
+                    __try { *(uint32_t*)ADDR_CAMERA_TARGET_PED = g_spectate_ped; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            InterlockedIncrement(&g_render_faults);
+        }
     } else {
         g_silent_aim_on = g_silent_has_target = false;
         g_aimbot_aim_on = g_aimbot_has_target = false;
         InterlockedExchange(&g_silent_send_ok, 0);
     }
-    aimbot_update_key();
-    aimbot_poll_capture();
-    misc_bind_poll_capture();
-    draw_aimbot_fov();
-    draw_silent_fov();
-    if (g_menu_open && g_current_tab == TAB_TROLL) troll_player_list_refresh();
-    if (g_menu_open) draw_menu();
-    notify_draw();
-
-    ImGui::EndFrame();
-    ImGui::Render();
-    ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    uint64_t t1 = now_us();
+    g_us_gameplay += t1 - t0;
+    bool frame_begun = true;
+    __try {
+        aimbot_update_key();
+        aimbot_poll_capture();
+        misc_bind_poll_capture();
+        draw_aimbot_fov();
+        draw_silent_fov();
+        if (g_menu_open && g_current_tab == TAB_TROLL) troll_player_list_refresh();
+        if (g_menu_open) draw_menu();
+        notify_draw();
+        uint64_t t2 = now_us();
+        g_us_ui += t2 - t1;
+        ImGui::EndFrame();
+        frame_begun = false;
+        ImGui::Render();
+        ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+        g_us_present += now_us() - t2;
+        g_us_frames++;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement(&g_render_faults);
+        if (frame_begun) {
+            __try { ImGui::EndFrame(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
 
     return g_o_EndScene(pDevice);
 }
@@ -5278,12 +6071,42 @@ static void install_d3d9_hooks() {
 
 static HMODULE find_mod() { return GetModuleHandleA("netc.dll"); }
 
-static unsigned g_ok = 0, g_miss = 0, g_fail = 0;
+// Pin netc.dll for the process lifetime. GET_MODULE_HANDLE_EX_FLAG_PIN (0x1)
+// bumps the loader refcount permanently — MTA's FreeLibrary on server switch
+// decrements but never reaches zero, loader never unloads. No unload -> no
+// rebase -> no reinstall -> no new trampolines. Patches written once, stay put.
+static HMODULE g_netc_pin = nullptr;
+
+static bool pin_netc() {
+    if (g_netc_pin) return true;
+    HMODULE h = nullptr;
+    for (int i = 0; i < 240; ++i) {
+        if (InterlockedCompareExchange(&g_shutdown_all, 0, 0)) return false;
+        if (GetModuleHandleExA(0x00000001 /*GET_MODULE_HANDLE_EX_FLAG_PIN*/,
+                               "netc.dll", &h) && h) {
+            g_netc_pin = h;
+            uint32_t size = 0;
+            __try {
+                IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)h;
+                IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)((uint8_t*)h + dos->e_lfanew);
+                size = nt->OptionalHeader.SizeOfImage;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            mta_logf("pin", "netc.dll PINNED at %p (image=%uKB) — cannot unload",
+                     (void*)h, (unsigned)(size / 1024));
+            return true;
+        }
+        Sleep(250);
+    }
+    mta_logf("pin!", "netc.dll not found after 60s — pin failed");
+    return false;
+}
+
+static unsigned g_ok = 0, g_miss = 0, g_fail = 0;	
 
 template<typename T>
 static bool try_install_global(const char* name, const char* pat, const char* msk, unsigned occ,
                                T detour, T& original_out) {
-    if (g_patch_count >= 60) { ++g_fail; return false; }
+    if (g_patch_count >= 92) { ++g_fail; return false; }
     void* addr = scan_mask(find_mod(), pat, msk, occ);
     if (!addr) { ++g_miss; return false; }
 
@@ -5303,7 +6126,7 @@ static bool try_install(const char* name, const char* pat, const char* msk, unsi
 
 template<typename T>
 static bool try_install_rva(const char* name, uint32_t rva, T detour) {
-    if (g_patch_count >= 60) { ++g_fail; return false; }
+    if (g_patch_count >= 92) { ++g_fail; return false; }
     if (!g_netc_base || !g_netc_size) { ++g_miss; return false; }
     uint32_t addr = g_netc_base + rva;
     if (addr < 0x10000u || addr + 5 > 0x7FFFFFFFu) { ++g_miss; return false; }
@@ -5497,18 +6320,29 @@ static void install_all() {
         PAT_SUB_100D57B0, MSK_SUB_100D57B0, 1,
         &d_sub_100D57B0);
 
+ 
+	
+    try_install_rva<fn_ac_check_hooking_function>(
+        "ac_check_hooking_function", 0x6BC90, &d_ac_check_hooking_function); // safe
     try_install_rva<LONG(__stdcall*)(void*)>(
-        "ac_veh_stack", 0x11E9C0, &d_veh_stack);
-    try_install_rva<DWORD(__stdcall*)(void*)>(
+        "ac_veh_stack", 0x11E9C0, &d_veh_stack); // safe
+    try_install_rva<fn_ac_send_client_kick>(  
+        "ac_send_client_kick", 0x1CCF40, &d_ac_send_client_kick); // safe
+    try_install_rva<fn_add_ac_log_path_hook>(
+        "add_ac_log_path_hook", 0x29910, &d_add_ac_log_path_hook);
+    try_install_rva<fn_ac_watchdog>(
+        "ac_watchdog", 0x2A8930, &d_ac_watchdog);
+       try_install_rva<DWORD(__stdcall*)(void*)>(
         "ac_start_watchdog", 0x2A8AD0, &d_ac_start_watchdog);
-}
 
-static volatile LONG g_init = 0;
+   
+}
 
 static DWORD WINAPI thread(LPVOID) {
     g_boot_tick = GetTickCount();
     HANDLE sh = CreateThread(nullptr, 0, session_heartbeat_thread, nullptr, 0, nullptr);
     if (sh) CloseHandle(sh);
+    pin_netc();
     install_all();
     silent_install_hook();
     mta_logf("hook", "install_all: ok=%u miss=%u fail=%u patches=%d",
@@ -5527,18 +6361,24 @@ static DWORD WINAPI thread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
-        mta_logf("boot", "DLL_PROCESS_ATTACH | rev=R43 | build %s %s | log=%s",
+        mta_logf("boot", "DLL_PROCESS_ATTACH | rev=R55 | build %s %s | log=%s",
                  __DATE__, __TIME__, mta_log_path());
-        if (InterlockedCompareExchange(&g_init, 1, 0) == 0) {
+        if (InterlockedCompareExchange(&g_init_top, 1, 0) == 0) {
             HANDLE t = CreateThread(nullptr, 0, thread, nullptr, 0, nullptr);
             if (t) CloseHandle(t);
         }
     } else if (reason == DLL_PROCESS_DETACH) {
         if (lpReserved != nullptr) {
+            // Process exit: nada de alocar. Restaura game_sa primeiro
+            // (quit_flush) e netc por ultimo (quit_hard_restore flusha
+            // g_quit_flush ao final). Ordem garantida.
             quit_flush();
             quit_hard_restore();
             return TRUE;
         }
+        // FreeLibrary normal: game_sa retirado em quit_flush, netc
+        // restaurado por ultimo dentro de quit_hard_restore (chamado
+        // por emergency_disable_all -> quit_hard_restore).
         quit_flush();
         emergency_disable_all();
         unpatch_all();
