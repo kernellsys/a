@@ -4919,8 +4919,7 @@ static void silent_update(IDirect3DDevice9* dev) {
     InterlockedExchange(&g_silent_send_ok, 0);
     if (!session_live()) { g_silent_aim_on = false; return; }
     g_silent_aim_on = g_silent_enable &&
-        ((GetAsyncKeyState(g_silent_key_vk) & 0x8000) != 0 ||
-         (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);  // fire tambem arma
+        ((GetAsyncKeyState(g_silent_key_vk) & 0x8000) != 0);
     if (!g_silent_enable || !g_silent_aim_on || g_menu_open ||
         g_silent_capturing || !dev) return;
     HWND fg = GetForegroundWindow();
